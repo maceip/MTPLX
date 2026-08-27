@@ -10142,20 +10142,23 @@ def _generate_one_shot_public(
                     seed=args.seed,
                 )
             else:
-                out = generate_mtpk(
-                    rt,
-                    prompt_ids,
-                    max_tokens=max_tokens_value,
-                    sampler=sampler,
-                    draft_sampler=_draft_sampler_from_spec(draft_sampler),
-                    speculative_depth=args.depth,
-                    seed=args.seed,
-                    mtp_hidden_variant="post_norm",
-                    mtp_cache_policy="persistent",
-                    mtp_history_policy="committed",
-                    verify_strategy="capture_commit",
-                    verify_core="linear-gdn-from-conv-tape",
-                )
+                from mtplx.qwen4_exp_mtp_patch import qwen4_exp_product_verify_env
+
+                with qwen4_exp_product_verify_env(getattr(rt, "model", None)) as verify_strategy:
+                    out = generate_mtpk(
+                        rt,
+                        prompt_ids,
+                        max_tokens=max_tokens_value,
+                        sampler=sampler,
+                        draft_sampler=_draft_sampler_from_spec(draft_sampler),
+                        speculative_depth=args.depth,
+                        seed=args.seed,
+                        mtp_hidden_variant="post_norm",
+                        mtp_cache_policy="persistent",
+                        mtp_history_policy="committed",
+                        verify_strategy=verify_strategy,
+                        verify_core="linear-gdn-from-conv-tape",
+                    )
         finally:
             if smart_fans is not None and smart_request_id is not None:
                 smart_fans.end_request(smart_request_id, wait_for_restore=True)
@@ -10273,10 +10276,21 @@ def cmd_run_public(args: Any) -> int:
             tok_s_text = f"{tok_s:.2f}" if isinstance(tok_s, (int, float)) else "n/a"
             mode = str(stats.get("generation_mode") or "mtp").upper()
             mtp_depth = int(stats.get("mtp_depth") or 0)
+            extra = ""
+            accepted = stats.get("accepted_by_depth")
+            drafted = stats.get("drafted_by_depth")
+            if isinstance(accepted, list) and accepted:
+                extra += f" accept={accepted}"
+            if isinstance(drafted, list) and drafted:
+                extra += f" drafted={drafted}"
+            verify_calls = stats.get("verify_calls")
+            if isinstance(verify_calls, int) and verify_calls:
+                extra += f" verify_calls={verify_calls}"
             print(
                 f"\n[mtplx] profile={payload['profile']['name']} "
                 f"mode={mode} mtp_depth={mtp_depth} "
                 f"tokens={stats.get('generated_tokens')} tok_s={tok_s_text}"
+                f"{extra}"
             )
     return code
 
@@ -10930,21 +10944,24 @@ def _quickstart_generate(
                 token_callback=record_tokens,
             )
         else:
-            out = generate_mtpk(
-                rt,
-                prompt_ids,
-                max_tokens=max_tokens_value,
-                sampler=sampler,
-                draft_sampler=_draft_sampler_from_spec(draft_sampler),
-                speculative_depth=int(getattr(args, "depth", 3)),
-                seed=seed,
-                mtp_hidden_variant="post_norm",
-                mtp_cache_policy="persistent",
-                mtp_history_policy="committed",
-                verify_strategy="capture_commit",
-                verify_core="linear-gdn-from-conv-tape",
-                token_callback=record_tokens,
-            )
+            from mtplx.qwen4_exp_mtp_patch import qwen4_exp_product_verify_env
+
+            with qwen4_exp_product_verify_env(getattr(rt, "model", None)) as verify_strategy:
+                out = generate_mtpk(
+                    rt,
+                    prompt_ids,
+                    max_tokens=max_tokens_value,
+                    sampler=sampler,
+                    draft_sampler=_draft_sampler_from_spec(draft_sampler),
+                    speculative_depth=int(getattr(args, "depth", 3)),
+                    seed=seed,
+                    mtp_hidden_variant="post_norm",
+                    mtp_cache_policy="persistent",
+                    mtp_history_policy="committed",
+                    verify_strategy=verify_strategy,
+                    verify_core="linear-gdn-from-conv-tape",
+                    token_callback=record_tokens,
+                )
     finally:
         if smart_fans is not None and smart_request_id is not None:
             smart_fans.end_request(smart_request_id, wait_for_restore=False)

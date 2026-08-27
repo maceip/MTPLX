@@ -4354,7 +4354,7 @@ def _sample_from_logits(
                 config.frequency_penalty,
                 penalty_overlay=penalty_overlay,
             )
-        _eval(logits)
+            _eval(logits)
         return int(mx.argmax(logits, axis=-1).item()), None
     probs = _distribution_from_mlx_logits(
         logits, config, token_counts=token_counts, penalty_overlay=penalty_overlay
@@ -5785,6 +5785,16 @@ def generate_ar(
                         token_callback(released)
         emit_trace()
 
+    # Double-buffered decode (mlx-lm pattern): dispatch step t+1's forward
+    # without blocking and let the next sample's materialization be the only
+    # block point, so host bookkeeping overlaps GPU execution. MTPLX_SYNC_AR=1
+    # restores the historical blocking eval.
+    _ar_sync_eval = str(os.environ.get("MTPLX_SYNC_AR", "")).strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    ) or bool(os.environ.get("MTPLX_EVAL_AUDIT"))
     for step in range(max_tokens):
         if _loop_guard is not None:
             _guard_transition = _loop_guard.observe(tokens)
@@ -5877,10 +5887,22 @@ def generate_ar(
             hidden_next = None
         forward_graph_elapsed = time.perf_counter() - started
         eval_started = time.perf_counter()
-        if hidden_next is None:
-            _eval(logits_next)
+        if _ar_sync_eval:
+            if hidden_next is None:
+                _eval(logits_next)
+            else:
+                _eval(logits_next, hidden_next)
         else:
-            _eval(logits_next, hidden_next)
+            # Include cache roots so conv-state slices (not logits ancestors)
+            # materialize with this dispatch instead of chaining lazily into
+            # the next step's graph.
+            _async_roots = [logits_next] if hidden_next is None else [
+                logits_next,
+                hidden_next,
+            ]
+            _async_roots.extend(_tree_mx_arrays(cache))
+            mx.async_eval(*_async_roots)
+            _owner_progress_tick()
         eval_elapsed = time.perf_counter() - eval_started
         elapsed_decode = time.perf_counter() - started
         target_decode_time += elapsed_decode
@@ -6881,6 +6903,9 @@ def generate_mtpk(
             "'graphbank', 'graphbank_capture_commit', 'target_prefix', "
             "or 'trim_commit'"
         )
+    from .qwen4_exp_mtp_patch import maybe_refuse_qwen4_exp_verify_lane
+
+    maybe_refuse_qwen4_exp_verify_lane(rt.model, verify_strategy)
     target_prefix_verify = verify_strategy == "target_prefix"
     # Constrained requests never engage the exact A3B route: the route
     # pre-commits its rejection correction (no None-guard on the append),

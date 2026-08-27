@@ -185,6 +185,35 @@ def _get_kernel(block_t=None, input_dtype=None):
     return kernel
 
 
+def blocked_prefill_ineligibility_reason(
+    q: mx.array,
+    v: mx.array,
+    g: mx.array,
+    mask,
+    state,
+) -> Optional[str]:
+    """Return the first structural reason the blocked kernel cannot run, or None."""
+    if mask is not None:
+        return "mask is not None (scalar-gating kernel is unmasked only)"
+    if getattr(g, "ndim", 0) != 3:
+        return f"g.ndim={getattr(g, 'ndim', None)} (need 3; vectorized gating stays stock)"
+    if q.ndim != 4 or v.ndim != 4:
+        return f"q.ndim={q.ndim} v.ndim={v.ndim} (need 4)"
+    _B, _T, Hk, Dk = q.shape
+    Hv, Dv = v.shape[2:]
+    if Dk != 128:
+        return f"Dk={Dk} (kernel is hardcoded for Dk==128)"
+    if Dv % 32 != 0:
+        return f"Dv={Dv} (need Dv % 32 == 0)"
+    if Hk <= 0 or Hv % Hk != 0:
+        return f"Hv={Hv} Hk={Hk} (need Hv % Hk == 0)"
+    if q.dtype not in (mx.bfloat16, mx.float16, mx.float32):
+        return f"q.dtype={q.dtype} (need bf16/fp16/fp32)"
+    if state is not None and state.dtype != mx.float32:
+        return f"state.dtype={state.dtype} (need fp32)"
+    return None
+
+
 def blocked_prefill_eligible(
     q: mx.array,
     v: mx.array,
@@ -193,19 +222,7 @@ def blocked_prefill_eligible(
     state,
 ) -> bool:
     """Structural gate: route only shapes the kernel is written for."""
-    if mask is not None or g.ndim != 3:
-        return False
-    if q.ndim != 4 or v.ndim != 4:
-        return False
-    B, T, Hk, Dk = q.shape
-    Hv, Dv = v.shape[2:]
-    if Dk != 128 or Dv % 32 != 0 or Hk <= 0 or Hv % Hk != 0:
-        return False
-    if q.dtype not in (mx.bfloat16, mx.float16, mx.float32):
-        return False
-    if state is not None and state.dtype != mx.float32:
-        return False
-    return True
+    return blocked_prefill_ineligibility_reason(q, v, g, mask, state) is None
 
 
 def gated_delta_blocked_prefill(
@@ -418,13 +435,19 @@ def install_gdn_blocked_prefill_patch() -> dict:
     # first so they exist to be swept even before the model loads.
     import sys as _sys
 
-    for _name in ("mlx_lm.models.qwen3_5", "mlx_lm.models.qwen3_next"):
+    for _name in (
+        "mlx_lm.models.qwen3_5",
+        "mlx_lm.models.qwen3_next",
+        "mtplx.models.qwen4_exp",
+    ):
         try:
             __import__(_name)
         except Exception:
             pass
     for _name, _mod in list(_sys.modules.items()):
-        if _mod is None or not _name.startswith("mlx_lm"):
+        if _mod is None or not (
+            _name.startswith("mlx_lm") or _name.startswith("mtplx")
+        ):
             continue
         if getattr(_mod, "gated_delta_update", None) is original:
             try:
@@ -456,7 +479,9 @@ def uninstall_gdn_blocked_prefill_patch() -> None:
     import sys as _sys
 
     for _name, _mod in list(_sys.modules.items()):
-        if _mod is None or not _name.startswith("mlx_lm"):
+        if _mod is None or not (
+            _name.startswith("mlx_lm") or _name.startswith("mtplx")
+        ):
             continue
         current = getattr(_mod, "gated_delta_update", None)
         if current is not None and current is not original:

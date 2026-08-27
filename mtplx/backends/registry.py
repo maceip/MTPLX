@@ -14,6 +14,7 @@ RUNTIME_CONTRACT_FILE = "mtplx_runtime.json"
 SUPPORTED_ARCH_IDS = {
     "laguna-s-2.1-ar",
     "deepseek-v4",
+    "qwen4-exp",
     "qwen3-next-mtp",
     "deepseek-v3-mtp",
     "glm-moe-dsa-mtp",
@@ -24,6 +25,7 @@ SUPPORTED_ARCH_IDS = {
     "gemma4-assistant-mtp",
     "step3p5-mtp",
     "hy-v3-mtp",
+    "qwen4-exp-mtp",
 }
 
 TIER_VERIFIED = "verified"
@@ -220,6 +222,27 @@ ARCHITECTURE_CATALOG: dict[str, ArchitectureSupport] = {
         ),
         notes="Product-verified default backend; this remains the only promoted shipping runtime.",
     ),
+    "qwen4-exp-mtp": ArchitectureSupport(
+        arch_id="qwen4-exp-mtp",
+        display_name="Qwen3.8-Flash-Next / qwen4_exp MTP",
+        family="qwen4_exp",
+        backend="qwen3_next",
+        support_level="experimental-native-contract-gated",
+        runtime_compatibility="native-contract-gated",
+        can_run_verified=True,
+        aliases=("qwen4_exp", "Qwen4ExpForConditionalGeneration", "qwen4_exp_text"),
+        config_markers=("mtp_num_hidden_layers", "num_nextn_predict_layers"),
+        family_gate="qwen4-exp-mtp-head-plus-gdn-rollback",
+        references=(
+            "REFERENCES:mlx_lm/models/qwen4_exp.py",
+            "REFERENCES:transformers/models/qwen4_exp/modeling_qwen4_exp.py",
+        ),
+        notes=(
+            "Native MTP for hybrid Gated DeltaNet + sparse QSA. Draft depth "
+            "tunes AR/D1/D2/D3; engine drafts up to N=4. Rejection restores "
+            "recurrent GDN state (KV trim is not sufficient)."
+        ),
+    ),
     "deepseek-v3-mtp": ArchitectureSupport(
         arch_id="deepseek-v3-mtp",
         display_name="DeepSeek V3 / V3.2 MTP",
@@ -293,6 +316,35 @@ ARCHITECTURE_CATALOG: dict[str, ArchitectureSupport] = {
             "stays 'native-ar-only' because it is what routes a checkpoint with "
             "no draft head to the AR-only verdict; an MTP-bearing artifact is "
             "resolved dynamically by the family gate instead."
+        ),
+    ),
+    "qwen4-exp": ArchitectureSupport(
+        arch_id="qwen4-exp",
+        display_name="Qwen3.8-Flash-Next (qwen4_exp)",
+        family="qwen",
+        backend="qwen4_exp",
+        support_level="experimental-native-ar-only",
+        runtime_compatibility="native-ar-only",
+        can_run_verified=True,
+        aliases=(
+            "qwen4_exp",
+            "qwen4_exp_text",
+            "qwen4exp",
+            "qwen4-exp",
+            "Qwen4ExpForConditionalGeneration",
+            "Qwen4ExpForCausalLM",
+        ),
+        config_markers=(),
+        family_gate="qwen4-exp-mlx",
+        references=(
+            "https://huggingface.co/Qwen/Qwen3.8-Flash-Next",
+            "/tmp/mlx-lm-pr1788/mlx_lm/models/qwen4_exp.py",
+        ),
+        notes=(
+            "Native MLX loader (mtplx.models.qwen4_exp) for Qwen3.8-Flash-Next "
+            "(architecture qwen4_exp). Day-0 support for hybrid linear-attention "
+            "(GatedDeltaNet), QSA sparse attention, gated residuals "
+            "(Hyper-Connections), sharded n-gram PLE embedding, and fine-grained MoE."
         ),
     ),
     "deepseek-v4-mtp": ArchitectureSupport(
@@ -1107,6 +1159,17 @@ def _passes_deepseek_v4_gate(inspection: Any) -> bool:
     return model_type == "deepseek_v4" or "deepseekv4forcausallm" in architecture
 
 
+def _passes_qwen4_exp_gate(inspection: Any) -> bool:
+    """Qwen3.8-Flash-Next / Qwen4-Exp MLX artifact: model_type qwen4_exp / qwen4_exp_text
+    or Qwen4ExpForConditionalGeneration architecture."""
+    model_type = _text(getattr(inspection, "model_type", None))
+    architecture = _compact(_text(getattr(inspection, "architecture", None)))
+    return (
+        model_type in {"qwen4_exp", "qwen4_exp_text"}
+        or "qwen4exp" in architecture
+    )
+
+
 def _passes_mlx_lm_ar_gate(inspection: Any) -> bool:
     """Trunk weights exist and the declared quantization is constructible."""
     model_dir = getattr(inspection, "model_dir", None)
@@ -1178,6 +1241,8 @@ def _passes_family_runtime_gate(arch_id: str, inspection: Any, tensor_gate: bool
         return _passes_mlx_lm_ar_gate(inspection)
     if arch_id == "deepseek-v4":
         return _passes_deepseek_v4_gate(inspection)
+    if arch_id == "qwen4-exp":
+        return _passes_qwen4_exp_gate(inspection)
     if arch_id == "laguna-s-2.1-ar":
         return bool(
             getattr(inspection, "laguna_s_2_1_mlx_4bit_match", False)

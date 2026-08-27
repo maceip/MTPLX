@@ -1651,6 +1651,31 @@ def _set_metal_memory_limit(mx: Any, name: str, value: int) -> str:
     raise AttributeError(f"MLX memory cap API {name} is unavailable")
 
 
+# Short-decode activations/KV on the 101GB 4-bit qwen4_exp pack measured
+# ~2GB above shard bytes in bare mlx-lm (peak 103.2GB). The 4GiB pad keeps
+# the Metal wired floor off the 60%-of-RAM default (77GB on a 128GB Mac)
+# which swap-thrashes that pack (~1.5 tok/s vs ~37).
+_MODEL_RESIDENT_HEADROOM_BYTES = 4 * 1024**3
+
+
+def _minimum_resident_bytes_for_model_path(model_path: str | None) -> int | None:
+    """Disk shard bytes + activation headroom, or None when unknown."""
+
+    if not model_path:
+        return None
+    try:
+        from mtplx.engine_session import model_weights_bytes
+    except Exception:
+        return None
+    try:
+        weights = model_weights_bytes(model_path)
+    except Exception:
+        return None
+    if not weights:
+        return None
+    return int(weights) + int(_MODEL_RESIDENT_HEADROOM_BYTES)
+
+
 def _apply_metal_memory_caps(
     *,
     mx_module: Any | None = None,
@@ -1673,6 +1698,11 @@ def _apply_metal_memory_caps(
                                    RAM, capped at 160 GiB on very large Macs
 
     Both accept plain bytes or K/M/G/T suffix.
+
+    ``minimum_resident_bytes`` raises both caps to at least that floor
+    (ask/serve pass on-disk shard bytes + headroom). Without it, the 60%
+    wired default on a 128 GiB Mac is 77 GiB and swap-thrashes a 101 GiB
+    4-bit pack.
     """
     if mx_module is None:
         try:
@@ -1825,7 +1855,9 @@ def apply_memory_caps_preflight(
 
     Returns a JSON-safe receipt for the caller's payload/envelope.
     """
-    caps = _apply_metal_memory_caps()
+    caps = _apply_metal_memory_caps(
+        minimum_resident_bytes=_minimum_resident_bytes_for_model_path(model),
+    )
     outcome: dict[str, Any] = {
         "entry": str(entry),
         "metal_memory_caps": caps,
@@ -1859,11 +1891,13 @@ def _select_backend_context_window(
         if backend.backend_id == "laguna_ar"
         else int(model_max)
     )
+    if requested_value > 0:
+        return max(4_096, min(1_048_576, requested_value))
     return max(
         4_096,
         min(
             int(model_max),
-            requested_value if requested_value > 0 else int(default_value),
+            int(default_value),
         ),
     )
 
@@ -1980,13 +2014,18 @@ class ServerState:
         self.postcommit_executor = None
         self.rate_limiter = _RateLimiter(args.rate_limit)
         startup_backend = descriptor_for_backend_id(getattr(args, "backend_id", None))
-        minimum_resident_bytes = None
+        minimum_resident_bytes = _minimum_resident_bytes_for_model_path(
+            getattr(args, "model", None)
+        )
         if startup_backend.backend_id == "laguna_ar":
             from mtplx.models.laguna_config import (
                 LAGUNA_S_2_1_MIN_RESIDENT_BYTES,
             )
 
-            minimum_resident_bytes = LAGUNA_S_2_1_MIN_RESIDENT_BYTES
+            minimum_resident_bytes = max(
+                int(minimum_resident_bytes or 0),
+                int(LAGUNA_S_2_1_MIN_RESIDENT_BYTES),
+            )
         self.metal_memory_caps = _apply_metal_memory_caps(
             minimum_resident_bytes=minimum_resident_bytes,
         )
@@ -2107,6 +2146,14 @@ class ServerState:
         _startup_line(f"[5/6] Model loaded in {self.load_time_s:.1f}s")
         self.backend_descriptor = descriptor_from_runtime(self.runtime, args)
         args.backend_id = self.backend_descriptor.backend_id
+        from mtplx.qwen4_exp_mtp_patch import qwen4_exp_product_verify_strategy
+
+        qwen4_verify = qwen4_exp_product_verify_strategy(
+            getattr(self.runtime, "model", None)
+        )
+        if qwen4_verify is not None:
+            args.verify_strategy = qwen4_verify
+            os.environ["MTPLX_SKIP_VERIFY_SNAPSHOT"] = "0"
         if self.backend_descriptor.uses_draft_lm_head:
             _startup_line("[5/6] Installing native-MTP draft head")
         else:
@@ -3583,6 +3630,13 @@ def _resolve_context_window(tokenizer: Any, model_path: str) -> int:
                 value = section.get(key)
                 if isinstance(value, int):
                     candidates.append(value)
+            rope_scaling = section.get("rope_scaling")
+            if isinstance(rope_scaling, dict):
+                factor = rope_scaling.get("factor")
+                if isinstance(factor, (int, float)) and factor > 1:
+                    orig = section.get("original_max_position_embeddings") or section.get("max_position_embeddings")
+                    if isinstance(orig, int):
+                        candidates.append(int(orig * factor))
 
     sane = [value for value in candidates if 0 < value <= 1_048_576]
     return max(sane) if sane else 262_144

@@ -112,7 +112,7 @@ class TunePolicy:
     supported: bool
     control_field: str = "depth"
     candidates: tuple[str, ...] = ("AR", "D1", "D2", "D3")
-    supported_families: tuple[str, ...] = ("qwen3_5", "qwen3_6", "qwen3_8", "gemma4")
+    supported_families: tuple[str, ...] = ("qwen3_5", "qwen3_6", "qwen3_8", "qwen4_exp", "gemma4")
     unsupported_reason: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
@@ -445,6 +445,22 @@ QWEN3_8_DRAFT_SEMANTICS = DraftSemantics(
     maximum=3,
     unit="depth",
 )
+# Qwen3.8-Flash-Next (model_type qwen4_exp). Default to D1 (safe operating point;
+# D2/D3 are serial target decode until causal packed verification is implemented;
+# D4 is refused to prevent causality leakage).
+QWEN4_EXP_DRAFT_SEMANTICS = DraftSemantics(
+    request_field="depth",
+    display_label="Draft depth",
+    default=1,
+    minimum=1,
+    maximum=3,
+    unit="depth",
+)
+QWEN4_EXP_TUNE_POLICY = TunePolicy(
+    supported=True,
+    candidates=("AR", "D1", "D2", "D3"),
+    supported_families=("qwen3_5", "qwen3_6", "qwen3_8", "qwen4_exp", "gemma4"),
+)
 
 
 def sampler_defaults_for_model(
@@ -458,7 +474,7 @@ def sampler_defaults_for_model(
         model_ref=model_ref,
         descriptor=resolved,
     )
-    if family == "qwen3_8":
+    if family in {"qwen3_8", "qwen4_exp"}:
         return QWEN3_8_SAMPLER_DEFAULTS
     return resolved.sampler_defaults
 
@@ -474,6 +490,8 @@ def draft_semantics_for_model(
         model_ref=model_ref,
         descriptor=resolved,
     )
+    if family == "qwen4_exp":
+        return QWEN4_EXP_DRAFT_SEMANTICS
     if family == "qwen3_8":
         return QWEN3_8_DRAFT_SEMANTICS
     return resolved.draft_semantics
@@ -938,6 +956,8 @@ def descriptor_for_architecture_id(value: str | None) -> BackendDescriptor | Non
         return None
     if arch_id in {"glm-moe-dsa-mtp", "glm4-moe-lite-mtp"}:
         return GLM_MTP_DESCRIPTOR
+    if arch_id == "qwen4-exp-mtp":
+        return QWEN3_NEXT_DESCRIPTOR
     for descriptor in backend_descriptors():
         if descriptor.architecture_id == arch_id:
             return descriptor
@@ -978,6 +998,8 @@ _QWEN3_8_MARKER = re.compile(r"qwen3[._-]?8(?!\d*b)")
 
 
 def _explicit_qwen_family_marker(text: str) -> str | None:
+    if "qwen4_exp" in text or "qwen4-exp" in text or "flash-next" in text or "flash.next" in text:
+        return "qwen4_exp"
     if _QWEN3_8_MARKER.search(text):
         return "qwen3_8"
     if "qwen3.6" in text or "qwen3_6" in text or "qwen36" in text or "qwen3-6" in text:
@@ -1093,6 +1115,8 @@ def tune_policy_for_model(
     )
     if family in {"qwen3_5", "qwen3_6"}:
         return TunePolicy(supported=True)
+    if family == "qwen4_exp":
+        return QWEN4_EXP_TUNE_POLICY
     if family == "qwen3_8":
         # Multi-step-trained MTP head wants deeper candidates, but the live
         # depth-4 lane killed the daemon on drop day (see
@@ -1123,7 +1147,7 @@ def kv_quant_policy_for_model(
         model_ref=model_ref,
         descriptor=descriptor,
     )
-    if family in {"qwen3_5", "qwen3_6", "qwen3_8"}:
+    if family in {"qwen3_5", "qwen3_6", "qwen3_8", "qwen4_exp"}:
         return QWEN3_NEXT_DESCRIPTOR.kv_quant_policy
     if family == "gemma4":
         return GEMMA4_ASSISTANT_DESCRIPTOR.kv_quant_policy
@@ -1167,7 +1191,7 @@ def context_window_policy_for_model(
         model_ref=model_ref,
         descriptor=descriptor,
     )
-    if family in {"qwen3_5", "qwen3_6", "qwen3_8"}:
+    if family in {"qwen3_5", "qwen3_6", "qwen3_8", "qwen4_exp"}:
         base = QWEN3_NEXT_DESCRIPTOR.context_window_policy
     elif family == "gemma4":
         base = GEMMA4_ASSISTANT_DESCRIPTOR.context_window_policy
@@ -1193,7 +1217,7 @@ def reasoning_policy_for_model(
         model_ref=model_ref,
         descriptor=descriptor,
     )
-    if family == "qwen3_8":
+    if family in {"qwen3_8", "qwen4_exp"}:
         return QWEN3_8_REASONING_CODEC
     if family in {"qwen3_5", "qwen3_6"}:
         return QWEN3_NEXT_DESCRIPTOR.reasoning_codec
@@ -1288,7 +1312,7 @@ def descriptor_for_model(
         model_ref=model_ref,
         descriptor=descriptor,
     )
-    if family != "qwen3_8":
+    if family not in {"qwen3_8", "qwen4_exp"}:
         return descriptor
     return replace(
         descriptor,

@@ -111,6 +111,34 @@ def test_apply_metal_memory_caps_preserves_128g_defaults(monkeypatch):
     assert calls == [("memory", 96 * GiB), ("wired", int(128 * GiB * 0.60))]
 
 
+def test_apply_metal_memory_caps_raises_floor_for_101g_model(monkeypatch):
+    mx, calls = _fake_mx(top_level=True)
+    monkeypatch.delenv("MTPLX_MEMORY_LIMIT_BYTES", raising=False)
+    monkeypatch.delenv("MTPLX_WIRED_LIMIT_BYTES", raising=False)
+    floor = 101 * GiB + 4 * GiB
+
+    result = openai._apply_metal_memory_caps(
+        mx_module=mx,
+        total_ram_bytes=128 * GiB,
+        minimum_resident_bytes=floor,
+    )
+
+    assert result["applied"] is True
+    assert result["memory_limit_bytes"] == floor
+    assert result["wired_limit_bytes"] == floor
+    assert result["minimum_resident_bytes"] == floor
+    assert calls == [("memory", floor), ("wired", floor)]
+
+
+def test_minimum_resident_bytes_for_model_path_adds_headroom(tmp_path):
+    shard = tmp_path / "model-00001-of-00001.safetensors"
+    shard.write_bytes(b"x" * 4096)
+
+    got = openai._minimum_resident_bytes_for_model_path(str(tmp_path))
+
+    assert got == 4096 + openai._MODEL_RESIDENT_HEADROOM_BYTES
+
+
 def test_apply_metal_memory_caps_raises_default_wired_floor_for_laguna(
     monkeypatch,
 ):

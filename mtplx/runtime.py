@@ -274,6 +274,18 @@ class MTPLXRuntime:
     ):
         text_model = getattr(self.model, "language_model", self.model)
         inner = getattr(text_model, "model", None)
+        if inner is not None and getattr(inner, "_mtplx_qwen4_exp_capture", False):
+            from .qwen4_exp_mtp_patch import forward_with_qwen4_exp_gdn_capture
+
+            self._count("forward_ar_capture_qwen4_exp_calls")
+            return forward_with_qwen4_exp_gdn_capture(
+                self.model,
+                input_ids,
+                cache=cache,
+                return_hidden=return_hidden,
+                hidden_variant=hidden_variant,
+                capture_backend=capture_backend,
+            )
         if not (hasattr(inner, "fa_idx") and hasattr(inner, "ssm_idx")):
             # Uniform full-attention model (e.g. hy_v3): every layer is plain
             # causal attention, so there is no GDN/recurrent state to capture
@@ -580,6 +592,29 @@ def load(
     never reduced.
     """
     path = Path(model_path)
+    # Pin MLX Metal allocator caps with the model-size floor BEFORE weights
+    # load. Serve applies this at startup; ask/bench/scripts converge here.
+    # Without the floor, the 60%-of-RAM default wired cap (77GiB on a 128GiB
+    # Mac) leaves a 101GiB pack partially unwired and decode swap-thrashes
+    # (~1.5-7 tok/s vs ~37 with the floor).
+    try:
+        from .server.openai import (
+            _apply_metal_memory_caps,
+            _minimum_resident_bytes_for_model_path,
+        )
+
+        _caps_receipt = _apply_metal_memory_caps(
+            minimum_resident_bytes=_minimum_resident_bytes_for_model_path(str(path))
+        )
+        if not _caps_receipt.get("applied", False):
+            print(
+                "[mtplx] metal memory caps not applied: "
+                f"{_caps_receipt.get('reason')}",
+                flush=True,
+            )
+    except Exception as _caps_exc:  # never block loading on cap plumbing
+        print(f"[mtplx] metal memory caps skipped: {_caps_exc}", flush=True)
+
     from .gemma4_pair import resolve_gemma4_pair_paths
 
     gemma4_pair = resolve_gemma4_pair_paths(path)
@@ -722,6 +757,10 @@ def load(
             is_deepseek_v4_mtp_config,
         )
         from .qwen3_5_mtp_patch import inject_qwen3_5_mtp_support
+        from .qwen4_exp_mtp_patch import (
+            inject_qwen4_exp_mtp_support,
+            is_qwen4_exp_mtp_config,
+        )
 
         if is_deepseek_v4_mtp_config(config):
             # Native draft head: the block binds through the ordinary load path
@@ -743,6 +782,8 @@ def load(
             mtp_enabled = inject_hy_v3_mtp_support(model, path, config, contract)
         elif is_qwen3_5_mtp_config(config):
             mtp_enabled = inject_qwen3_5_mtp_support(model, path, config, contract)
+        elif is_qwen4_exp_mtp_config(config):
+            mtp_enabled = inject_qwen4_exp_mtp_support(model, path, config, contract)
         elif is_deepseek_mtp_config(config):
             mtp_enabled = inject_deepseek_mtp_support(model, path, config, contract)
         else:
@@ -1012,6 +1053,16 @@ def _model_classes_for_config(config: dict[str, Any]) -> tuple[type, type] | Non
 
     if str(config.get("model_type") or "").lower() == "deepseek_v4":
         from .models.deepseek_v4 import Model, ModelArgs
+
+        return Model, ModelArgs
+    mtype = str(
+        config.get("model_type")
+        or (config.get("text_config") or {}).get("model_type")
+        or ""
+    ).lower()
+    archs = [str(a).lower() for a in (config.get("architectures") or [])]
+    if mtype in {"qwen4_exp", "qwen4_exp_text"} or any("qwen4exp" in a for a in archs):
+        from .models.qwen4_exp import Model, ModelArgs
 
         return Model, ModelArgs
     if not _is_laguna_s_2_1_mlx_4bit_config(config):

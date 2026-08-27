@@ -136,6 +136,12 @@ def split_sdpa_output(
 
 
 def _attention_has_gated_q_proj(attn: Any) -> bool:
+    # QSA (qwen4_exp) uses a gated q_proj of the same 2*heads*dim shape as
+    # Qwen3Next, plus an indexer. The split hook reimplements dense gated
+    # SDPA with mlx-lm RoPE and would drop that indexer — never treat QSA as
+    # house gated-q, even if a caller installed the wrapper anyway.
+    if getattr(attn, "indexer", None) is not None:
+        return False
     q_proj = getattr(attn, "q_proj", None)
     q_norm = getattr(attn, "q_norm", None)
     if q_proj is None or q_norm is None:
@@ -460,8 +466,19 @@ def _full_attention_layers(model: Any):
         if getattr(layer, "is_linear", False):
             continue
         attn = getattr(layer, "self_attn", None)
-        if attn is not None:
-            yield attn
+        if attn is None:
+            continue
+        # QSA indexer is load-bearing for long prompts. split_call patches
+        # class __call__ to a 4-arg house signature and, when enabled,
+        # replaces the body with Qwen3Next dense gated SDPA (mlx-lm RoPE,
+        # no indexer). Installing that on qwen4_exp would TypeError on the
+        # old (x, rope, mask, cache, idx_cache) call or silently drop
+        # sparsity after the house-signature conform. Skip the install;
+        # QSA keeps its own path. Same refusal style as Laguna skipping
+        # the qwen3-next kernel stack, scoped to this incompatible hook.
+        if getattr(attn, "indexer", None) is not None:
+            continue
+        yield attn
 
 
 def configure_split_full_attention(
