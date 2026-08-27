@@ -1161,13 +1161,43 @@ def _passes_deepseek_v4_gate(inspection: Any) -> bool:
 
 def _passes_qwen4_exp_gate(inspection: Any) -> bool:
     """Qwen3.8-Flash-Next / Qwen4-Exp MLX artifact: model_type qwen4_exp / qwen4_exp_text
-    or Qwen4ExpForConditionalGeneration architecture."""
+    or Qwen4ExpForConditionalGeneration architecture, requiring model shards."""
     model_type = _text(getattr(inspection, "model_type", None))
     architecture = _compact(_text(getattr(inspection, "architecture", None)))
-    return (
+    if not (
         model_type in {"qwen4_exp", "qwen4_exp_text"}
         or "qwen4exp" in architecture
+    ):
+        return False
+    model_dir = getattr(inspection, "model_dir", None)
+    if not model_dir:
+        return False
+    try:
+        has_trunk = any(
+            path.name != "mtp.safetensors"
+            for path in Path(str(model_dir)).glob("*.safetensors")
+        )
+    except OSError:
+        return False
+    if not has_trunk:
+        return False
+    return _unsupported_quant_bits(model_dir) is None
+
+
+def _passes_qwen4_exp_mtp_gate(inspection: Any, tensor_gate: bool) -> bool:
+    """Qwen4-Exp MTP artifact: valid Qwen4-Exp model plus declared MTP markers or tensors."""
+    if not _passes_qwen4_exp_gate(inspection):
+        return False
+    keys = _weight_keys(inspection)
+    has_mtp_tensors = bool(
+        tensor_gate
+        or any(_is_sidecar_mtp_key(k) or "mtp." in k for k in (keys or ()))
     )
+    mtp_layers = int(getattr(inspection, "mtp_num_hidden_layers", 0) or 0)
+    mtp_dict = getattr(inspection, "mtp", None)
+    if mtp_dict is not None and isinstance(mtp_dict, dict):
+        mtp_layers = max(mtp_layers, int(mtp_dict.get("num_hidden_layers", 0) or 0))
+    return bool(has_mtp_tensors or mtp_layers > 0)
 
 
 def _passes_mlx_lm_ar_gate(inspection: Any) -> bool:
@@ -1243,6 +1273,8 @@ def _passes_family_runtime_gate(arch_id: str, inspection: Any, tensor_gate: bool
         return _passes_deepseek_v4_gate(inspection)
     if arch_id == "qwen4-exp":
         return _passes_qwen4_exp_gate(inspection)
+    if arch_id == "qwen4-exp-mtp":
+        return _passes_qwen4_exp_mtp_gate(inspection, tensor_gate)
     if arch_id == "laguna-s-2.1-ar":
         return bool(
             getattr(inspection, "laguna_s_2_1_mlx_4bit_match", False)

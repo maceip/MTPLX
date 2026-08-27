@@ -76,13 +76,16 @@ class TailOwnedKVCache:
 
     @classmethod
     def from_cache(cls, entry: Any, *, mode: str, step: int | None = None) -> "TailOwnedKVCache":
-        return cls(
+        cache = cls(
             mode=mode,
             step=int(step or getattr(entry, "step", 256)),
             keys=getattr(entry, "keys", None),
             values=getattr(entry, "values", None),
             offset=int(getattr(entry, "offset", 0)),
         )
+        if hasattr(entry, "indexer"):
+            cache.indexer = getattr(entry, "indexer")
+        return cache
 
     def _own_tail(self, keys: Any, values: Any) -> tuple[Any, Any]:
         started = time.perf_counter()
@@ -160,6 +163,12 @@ class TailOwnedKVCache:
     def trim(self, n: int) -> int:
         n = min(int(self.offset), int(n))
         self.offset -= n
+        if hasattr(self, "indexer") and getattr(self, "indexer", None) is not None:
+            indexer = getattr(self, "indexer")
+            keys = getattr(indexer, "keys", None)
+            if keys is not None:
+                keep = int(keys.shape[1]) - int(n)
+                indexer.keys = keys[:, :keep, :] if keep > 0 else None
         return n
 
     def make_mask(self, *args, **kwargs):
@@ -217,13 +226,16 @@ class BlockOwnedKVCache(TailOwnedKVCache):
         mode: str,
         block_size: int | None = None,
     ) -> "BlockOwnedKVCache":
-        return cls(
+        cache = cls(
             mode=mode,
             block_size=int(block_size or getattr(entry, "step", 1024) or 1024),
             keys=getattr(entry, "keys", None),
             values=getattr(entry, "values", None),
             offset=int(getattr(entry, "offset", 0)),
         )
+        if hasattr(entry, "indexer"):
+            cache.indexer = getattr(entry, "indexer")
+        return cache
 
     def _record_shape(self, keys: Any, values: Any) -> None:
         self._tail_shape = (
@@ -888,7 +900,7 @@ class VllmMetalPagedKVCache:
         turboquant_config: Any | None = None,
         kv_quant_config: Any | None = None,
     ) -> "VllmMetalPagedKVCache":
-        return cls(
+        paged = cls(
             block_size=block_size,
             num_blocks=num_blocks,
             keys=getattr(entry, "keys", None),
@@ -897,6 +909,9 @@ class VllmMetalPagedKVCache:
             turboquant_config=turboquant_config,
             kv_quant_config=kv_quant_config,
         )
+        if hasattr(entry, "indexer"):
+            paged.indexer = getattr(entry, "indexer")
+        return paged
 
     @property
     def allocated_blocks(self) -> int | None:
@@ -1956,6 +1971,12 @@ class VllmMetalPagedKVCache:
             self._dequant_memo["tokens"] = min(
                 int(self._dequant_memo["tokens"]), int(self.offset)
             )
+        if hasattr(self, "indexer") and getattr(self, "indexer", None) is not None:
+            indexer = getattr(self, "indexer")
+            keys = getattr(indexer, "keys", None)
+            if keys is not None:
+                keep = int(keys.shape[1]) - int(n)
+                indexer.keys = keys[:, :keep, :] if keep > 0 else None
         # The kv_quant numerics route deliberately survives trim():
         # speculative-verify rejections retract rows mid-request, and
         # re-latching here would switch math when a rejection lands the
@@ -2687,13 +2708,16 @@ class TensorOffsetVllmMetalPagedKVCache:
     def from_paged_cache(cls, entry: VllmMetalPagedKVCache) -> "TensorOffsetVllmMetalPagedKVCache":
         if entry.key_cache is None or entry.value_cache is None:
             raise ValueError("cannot promote empty paged KV cache")
-        return cls(
+        promoted = cls(
             key_cache=entry.key_cache,
             value_cache=entry.value_cache,
             offset=int(entry.offset),
             block_size=int(entry.block_size),
             num_blocks=int(entry.num_blocks),
         )
+        if hasattr(entry, "indexer"):
+            promoted.indexer = getattr(entry, "indexer")
+        return promoted
 
     @property
     def key_cache(self):
@@ -2923,6 +2947,8 @@ class TensorOffsetVllmMetalPagedKVCache:
             block_size=int(self.block_size),
             num_blocks=int(self.num_blocks),
         )
+        if hasattr(self, "indexer"):
+            paged.indexer = getattr(self, "indexer")
         if self.cache[0] is None or self.cache[1] is None:
             return paged
         paged.key_cache = self.cache[0]

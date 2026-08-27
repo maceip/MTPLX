@@ -1858,6 +1858,24 @@ def apply_memory_caps_preflight(
     caps = _apply_metal_memory_caps(
         minimum_resident_bytes=_minimum_resident_bytes_for_model_path(model),
     )
+    if caps.get("reason") in {
+        "insufficient_ram",
+        "configured_cap_below_model_minimum",
+    }:
+        required_gib = (
+            int(caps.get("minimum_resident_bytes") or 0) / 1024**3
+        )
+        model_label = model or "The model"
+        if caps.get("reason") == "configured_cap_below_model_minimum":
+            raise RuntimeError(
+                f"{entry}: {model_label} cannot load inside configured Metal memory caps; "
+                f"at least {required_gib:.1f} GiB resident plus 16 GiB system headroom is required"
+            )
+        raise RuntimeError(
+            f"{entry}: {model_label} cannot load inside the available Metal memory "
+            f"budget; at least {required_gib:.1f} GiB resident plus "
+            "16 GiB system headroom is required"
+        )
     outcome: dict[str, Any] = {
         "entry": str(entry),
         "metal_memory_caps": caps,
@@ -1891,13 +1909,12 @@ def _select_backend_context_window(
         if backend.backend_id == "laguna_ar"
         else int(model_max)
     )
-    if requested_value > 0:
-        return max(4_096, min(1_048_576, requested_value))
+    target_value = requested_value if requested_value > 0 else int(default_value)
     return max(
         4_096,
         min(
             int(model_max),
-            int(default_value),
+            target_value,
         ),
     )
 
@@ -2036,8 +2053,19 @@ class ServerState:
             required_gib = (
                 int(self.metal_memory_caps.get("minimum_resident_bytes") or 0) / 1024**3
             )
+            model_label = (
+                getattr(args, "model", None)
+                or getattr(startup_backend, "display_name", None)
+                or getattr(startup_backend, "backend_id", None)
+                or "The selected model"
+            )
+            if self.metal_memory_caps.get("reason") == "configured_cap_below_model_minimum":
+                raise RuntimeError(
+                    f"{model_label} cannot load inside configured Metal memory caps; "
+                    f"at least {required_gib:.1f} GiB resident plus 16 GiB system headroom is required"
+                )
             raise RuntimeError(
-                "Laguna-S-2.1 cannot load inside the available Metal memory "
+                f"{model_label} cannot load inside the available Metal memory "
                 f"budget; at least {required_gib:.1f} GiB resident plus "
                 "16 GiB system headroom is required"
             )

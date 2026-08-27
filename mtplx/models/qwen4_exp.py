@@ -1760,15 +1760,16 @@ class Model(nn.Module):
 
     def sanitize(self, weights: Dict[str, Any]) -> Dict[str, Any]:
         sanitized = sanitize(weights)
-        # Retain MTP tensors accessible via side-channel for MTP lane
+        # Retain MTP tensors accessible via side-channel for MTP lane,
+        # but exclude them from strict trunk loading.
         self.mtp_weights = {
             k: v for k, v in sanitized.items() if k.startswith("mtp.")
         }
-        return sanitized
+        return {k: v for k, v in sanitized.items() if not k.startswith("mtp.")}
 
     @property
-    def quant_predicate(self) -> Callable[[str, Any, Any], bool]:
-        def fn(path: str, module: Any, _: Any) -> bool:
+    def quant_predicate(self) -> Callable[[str, Any], bool]:
+        def fn(path: str, module: Any) -> bool:
             # Keep MoE router in full precision; norms and convs are skipped anyway
             return not path.endswith("mlp.gate")
 

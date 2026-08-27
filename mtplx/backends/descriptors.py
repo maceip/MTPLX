@@ -934,6 +934,8 @@ DESCRIPTORS_BY_BACKEND_ID: dict[str, BackendDescriptor] = {
     HY_V3_MTP_DESCRIPTOR.backend_id: HY_V3_MTP_DESCRIPTOR,
     "mimo_mtp": NATIVE_CONTRACT_DESCRIPTOR,
     "nemotron_h_mtp": NATIVE_CONTRACT_DESCRIPTOR,
+    "deepseek_v4": MLX_LM_AR_DESCRIPTOR,
+    "qwen4_exp": MLX_LM_AR_DESCRIPTOR,
 }
 
 
@@ -958,6 +960,8 @@ def descriptor_for_architecture_id(value: str | None) -> BackendDescriptor | Non
         return GLM_MTP_DESCRIPTOR
     if arch_id == "qwen4-exp-mtp":
         return QWEN3_NEXT_DESCRIPTOR
+    if arch_id == "qwen4-exp":
+        return MLX_LM_AR_DESCRIPTOR
     for descriptor in backend_descriptors():
         if descriptor.architecture_id == arch_id:
             return descriptor
