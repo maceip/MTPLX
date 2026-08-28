@@ -1524,6 +1524,107 @@ class _IndexerCache(_BaseCache):
         return self.keys
 
     @property
+    def batch_size(self) -> int:
+        if self._buf is not None:
+            return int(self._buf.shape[0])
+        return 1
+
+    def empty(self) -> bool:
+        return self._buf is None or self._len == 0
+
+    def filter(self, batch_indices: Any) -> None:
+        if self._buf is not None:
+            self._buf = self._buf[batch_indices]
+        self.pooled = None
+
+    def extend(self, other: Any) -> None:
+        if other is None:
+            return
+        self_k = self.keys
+        other_k = getattr(other, "keys", None)
+        if self_k is None and other_k is None:
+            self._buf = None
+            self._len = 0
+            self.pooled = None
+            return
+
+        a_batch = self.batch_size
+        b_batch = getattr(other, "batch_size", 1)
+        L1 = int(self_k.shape[1]) if self_k is not None else 0
+        L2 = int(other_k.shape[1]) if other_k is not None else 0
+        max_L = max(L1, L2)
+        D = (
+            self_k.shape[-1]
+            if self_k is not None
+            else (other_k.shape[-1] if other_k is not None else 128)
+        )
+        dt = (
+            self_k.dtype
+            if self_k is not None
+            else (other_k.dtype if other_k is not None else mx.float32)
+        )
+
+        def pad_right_aligned(k, batch, cur_len):
+            if k is None:
+                return mx.zeros((batch, max_L, D), dtype=dt)
+            if cur_len < max_L:
+                pad = max_L - cur_len
+                return mx.concatenate([mx.zeros((batch, pad, D), dtype=dt), k], axis=1)
+            return k
+
+        a_pad = pad_right_aligned(self_k, a_batch, L1)
+        b_pad = pad_right_aligned(other_k, b_batch, L2)
+        self._buf = mx.concatenate([a_pad, b_pad], axis=0)
+        self._len = max_L
+        self.pooled = None
+
+    def extract(self, idx: int) -> "_IndexerCache":
+        cache = _IndexerCache()
+        if self._buf is not None and self._len > 0:
+            k = self._buf[idx : idx + 1, : self._len, :]
+            cache.keys = mx.contiguous(k)
+        return cache
+
+    @classmethod
+    def merge(cls, caches: list[Any]) -> "_IndexerCache":
+        cache = cls()
+        if not caches or all(
+            c is None
+            or (hasattr(c, "empty") and c.empty())
+            or getattr(c, "_buf", None) is None
+            for c in caches
+        ):
+            return cache
+        keys_list = [getattr(c, "keys", None) for c in caches]
+        lengths = [int(k.shape[1]) if k is not None else 0 for k in keys_list]
+        max_len = max(lengths) if lengths else 0
+        if max_len == 0:
+            return cache
+        B = len(caches)
+        sample = next(k for k in keys_list if k is not None)
+        D = sample.shape[-1]
+        dt = sample.dtype
+        buf = mx.zeros((B, max_len, D), dtype=dt)
+        for i, (l, k) in enumerate(zip(lengths, keys_list)):
+            if k is not None and l > 0:
+                pad = max_len - l
+                buf[i : i + 1, pad:max_len, :] = k
+        cache._buf = buf
+        cache._len = max_len
+        cache.pooled = None
+        return cache
+
+    def trim(self, n: int) -> None:
+        if self._buf is not None and self._len > 0:
+            keep = self._len - int(n)
+            if keep <= 0:
+                self._buf = None
+                self._len = 0
+            else:
+                self._len = keep
+        self.pooled = None
+
+    @property
     def state(self):
         return self.keys
 
@@ -1536,6 +1637,60 @@ class _AttnCache(KVCache):
     def __init__(self):
         super().__init__()
         self.indexer = _IndexerCache()
+
+    def filter(self, batch_indices: Any) -> None:
+        if self.keys is not None:
+            self.keys = self.keys[batch_indices]
+            self.values = self.values[batch_indices]
+        if (
+            hasattr(self, "indexer")
+            and self.indexer is not None
+            and hasattr(self.indexer, "filter")
+        ):
+            self.indexer.filter(batch_indices)
+
+    def extend(self, other: Any) -> None:
+        if other is None:
+            return
+        if self.keys is None and getattr(other, "keys", None) is None:
+            pass
+        elif self.keys is None:
+            self.keys = other.keys
+            self.values = other.values
+            self.offset = getattr(other, "offset", 0)
+        elif getattr(other, "keys", None) is not None:
+            self.keys = mx.concatenate([self.keys, other.keys], axis=0)
+            self.values = mx.concatenate([self.values, other.values], axis=0)
+        if (
+            hasattr(self, "indexer")
+            and self.indexer is not None
+            and hasattr(self.indexer, "extend")
+        ):
+            self.indexer.extend(getattr(other, "indexer", None))
+
+    def extract(self, idx: int) -> "_AttnCache":
+        cache = _AttnCache()
+        if self.keys is not None:
+            cache.keys = mx.contiguous(self.keys[idx : idx + 1])
+            cache.values = mx.contiguous(self.values[idx : idx + 1])
+            cache.offset = cache.keys.shape[2]
+        if (
+            hasattr(self, "indexer")
+            and self.indexer is not None
+            and hasattr(self.indexer, "extract")
+        ):
+            cache.indexer = self.indexer.extract(idx)
+        return cache
+
+    @classmethod
+    def merge(cls, caches: list[Any]):
+        merged = super().merge(caches)
+        indexers = [getattr(c, "indexer", None) for c in caches]
+        merged.indexer = _IndexerCache.merge(indexers)
+        from mtplx.qwen4_exp_mtp_patch import _install_indexer_aware_trim
+
+        _install_indexer_aware_trim(merged)
+        return merged
 
     @property
     def state(self):
@@ -1718,27 +1873,32 @@ def _fuse_proj_pair(
 
 
 def _rewrite_packed_experts(weights: Dict[str, Any]) -> None:
-    """Keep HF packed experts.gate_up_proj as switch_mlp.gate_up_proj (no split)."""
+    """Keep HF packed experts.gate_up_proj and experts.down_proj as switch_mlp.* (no split).
+
+    Remaps all quantization leaves (weight, scales, biases, bias) so prequantized
+    sidecars load fully onto FusedSwitchGLU.
+    """
     for key in list(weights):
-        packed = False
-        if key.endswith(".mlp.experts.gate_up_proj"):
-            dest = (
-                key[: -len("experts.gate_up_proj")] + "switch_mlp.gate_up_proj.weight"
-            )
-            packed = True
-        elif key.endswith(".mlp.experts.gate_up_proj.weight"):
-            dest = key.replace(".mlp.experts.gate_up_proj.weight", ".mlp.switch_mlp.gate_up_proj.weight")
-            packed = True
-        elif key.endswith(".mlp.experts.down_proj"):
-            dest = key[: -len("experts.down_proj")] + "switch_mlp.down_proj.weight"
-            packed = True
-        elif key.endswith(".mlp.experts.down_proj.weight"):
-            dest = key.replace(
-                ".mlp.experts.down_proj.weight", ".mlp.switch_mlp.down_proj.weight"
-            )
-            packed = True
-        if packed:
-            weights[dest] = weights.pop(key)
+        for proj in ("gate_up_proj", "down_proj"):
+            if key.endswith(f".experts.{proj}") or key == f"experts.{proj}":
+                dest = key[: -len(f"experts.{proj}")] + f"switch_mlp.{proj}.weight"
+                weights[dest] = weights.pop(key)
+                break
+            matched = False
+            for leaf in _PROJ_LEAVES:
+                target_suffix = f".experts.{proj}.{leaf}"
+                if key.endswith(target_suffix):
+                    dest = key[: -len(target_suffix)] + f".switch_mlp.{proj}.{leaf}"
+                    weights[dest] = weights.pop(key)
+                    matched = True
+                    break
+                elif key == f"experts.{proj}.{leaf}":
+                    dest = f"switch_mlp.{proj}.{leaf}"
+                    weights[dest] = weights.pop(key)
+                    matched = True
+                    break
+            if matched:
+                break
 
 
 def remap_fused_projections(weights: Dict[str, Any]) -> Dict[str, Any]:

@@ -860,6 +860,151 @@ def test_compiled_linear_step_passes_recurrent_mask():
     assert new_rec.shape == (2, layer.linear_attn.n_v, layer.linear_attn.dv, layer.linear_attn.dk)
 
 
+def test_remap_packed_expert_quantization_leaves():
+    from mtplx.models.qwen4_exp import remap_fused_projections
+
+    quant_weights = {
+        "layers.0.mlp.experts.gate_up_proj.weight": mx.zeros((4, 64, 32)),
+        "layers.0.mlp.experts.gate_up_proj.scales": mx.ones((4, 64, 1)),
+        "layers.0.mlp.experts.gate_up_proj.biases": mx.zeros((4, 64, 1)),
+        "layers.0.mlp.experts.down_proj.weight": mx.zeros((4, 32, 64)),
+        "layers.0.mlp.experts.down_proj.scales": mx.ones((4, 32, 1)),
+        "layers.0.mlp.experts.down_proj.biases": mx.zeros((4, 32, 1)),
+    }
+    remapped = remap_fused_projections(quant_weights)
+
+    assert "layers.0.mlp.switch_mlp.gate_up_proj.weight" in remapped
+    assert "layers.0.mlp.switch_mlp.gate_up_proj.scales" in remapped
+    assert "layers.0.mlp.switch_mlp.gate_up_proj.biases" in remapped
+    assert "layers.0.mlp.switch_mlp.down_proj.weight" in remapped
+    assert "layers.0.mlp.switch_mlp.down_proj.scales" in remapped
+    assert "layers.0.mlp.switch_mlp.down_proj.biases" in remapped
+    assert not any("experts" in k for k in remapped)
+
+
+def test_reject_incomplete_mtp_sidecar(tmp_path):
+    import mlx.nn as nn
+    from mtplx.models.qwen4_exp import TextArgs
+    from mtplx.qwen4_exp_mtp_patch import inject_qwen4_exp_mtp_support
+
+    config = {
+        "model_type": "qwen4_exp",
+        "hidden_size": 128,
+        "num_hidden_layers": 4,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 2,
+        "head_dim": 32,
+        "mtp_num_hidden_layers": 1,
+        "hc_count": 2,
+        "hc_lowrank": 64,
+        "vocab_size": 50,
+    }
+
+    class DummyModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = SimpleNamespace(
+                layers=[
+                    SimpleNamespace(layer_type="linear_attention"),
+                    SimpleNamespace(layer_type="linear_attention"),
+                    SimpleNamespace(layer_type="linear_attention"),
+                    SimpleNamespace(layer_type="full_attention"),
+                ],
+                embed_tokens=nn.Embedding(50, 128),
+            )
+            self.lm_head = nn.Linear(128, 50, bias=False)
+            self.args = TextArgs(
+                hidden_size=128,
+                num_hidden_layers=4,
+                num_attention_heads=4,
+                num_key_value_heads=2,
+                head_dim=32,
+                hc_count=2,
+                hc_lowrank=64,
+                rope_parameters={},
+                rope_theta=10000.0,
+                partial_rotary_factor=0.25,
+                layer_types=["linear_attention", "linear_attention", "linear_attention", "full_attention"],
+                full_attention_interval=4,
+            )
+
+        def make_cache(self):
+            return [None] * 4
+
+    # 1. Truncated sidecar: save only 1 parameter
+    sf_path = tmp_path / "mtp.safetensors"
+    mx.save_safetensors(
+        str(sf_path),
+        {"mtp.pre_fc_norm_embedding.weight": mx.ones((128,))},
+    )
+
+    model = DummyModel()
+    res = inject_qwen4_exp_mtp_support(model, str(tmp_path), config, allow_random_init=False)
+    # Must fail because required MTP parameters are missing
+    assert res is False
+
+
+def test_qsa_indexer_cache_batch_protocol():
+    from mtplx.models.qwen4_exp import _AttnCache, _IndexerCache
+
+    # 1. _IndexerCache merge
+    idx1 = _IndexerCache()
+    idx1.update(mx.ones((1, 8, 128)))
+    idx1.pooled = mx.ones((1, 2, 128))
+
+    idx2 = _IndexerCache()
+    idx2.update(mx.full((1, 12, 128), 2.0))
+    idx2.pooled = mx.full((1, 3, 128), 2.0)
+
+    merged = _IndexerCache.merge([idx1, idx2])
+    assert merged.batch_size == 2
+    assert merged.keys.shape == (2, 12, 128)
+    assert merged.pooled is None  # Invalidated on merge
+
+    # 2. _IndexerCache filter
+    merged.filter(mx.array([1]))
+    assert merged.batch_size == 1
+    assert merged.keys.shape == (1, 12, 128)
+    assert float(merged.keys[0, -1, 0].item()) == 2.0
+
+    # 3. _IndexerCache extract
+    extracted = merged.extract(0)
+    assert extracted.batch_size == 1
+    assert extracted.keys.shape == (1, 12, 128)
+
+    # 4. _AttnCache merge, filter, extend, extract
+    a1 = _AttnCache()
+    a1.keys = mx.ones((1, 2, 8, 64))
+    a1.values = mx.ones((1, 2, 8, 64))
+    a1.offset = 8
+    a1.indexer.update(mx.ones((1, 8, 128)))
+
+    a2 = _AttnCache()
+    a2.keys = mx.full((1, 2, 12, 64), 3.0)
+    a2.values = mx.full((1, 2, 12, 64), 3.0)
+    a2.offset = 12
+    a2.indexer.update(mx.full((1, 12, 128), 3.0))
+
+    a_merged = _AttnCache.merge([a1, a2])
+    assert a_merged.keys.shape[0] == 2
+    assert hasattr(a_merged, "indexer")
+    assert a_merged.indexer.batch_size == 2
+    assert a_merged.indexer.keys.shape == (2, 12, 128)
+
+    # Filter a_merged
+    a_merged.filter(mx.array([1]))
+    assert a_merged.keys.shape[0] == 1
+    assert a_merged.indexer.batch_size == 1
+    assert float(a_merged.indexer.keys[0, -1, 0].item()) == 3.0
+
+    # Extract from a_merged
+    a_extracted = a_merged.extract(0)
+    assert hasattr(a_extracted, "indexer")
+    assert a_extracted.indexer.batch_size == 1
+    assert a_extracted.indexer.keys.shape == (1, 12, 128)
+
+
+
 
 
 

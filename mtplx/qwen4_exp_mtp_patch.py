@@ -808,25 +808,65 @@ def _trim_qsa_indexer(entry: Any, n: int) -> None:
 
 
 def _install_indexer_aware_trim(entry: Any) -> Any:
-    """KV trim must also rewind the QSA indexer; offset-only trim desyncs them."""
+    """KV cache operations must also update the QSA indexer; otherwise batch operations desync them."""
     if entry is None or getattr(entry, "_mtplx_indexer_trim", False):
         return entry
     orig = getattr(entry, "trim", None)
-    if not callable(orig):
-        return entry
+    if callable(orig):
+        def trim(n: int, _orig=orig, _entry=entry):
+            trimmed = _orig(n)
+            dropped = int(n if trimmed is None else trimmed)
+            if dropped:
+                _trim_qsa_indexer(_entry, dropped)
+            else:
+                reuse = getattr(_entry, "_sparse_index_reuse", None)
+                if reuse is not None and hasattr(reuse, "reset"):
+                    reuse.reset()
+            return trimmed
 
-    def trim(n: int, _orig=orig, _entry=entry):
-        trimmed = _orig(n)
-        dropped = int(n if trimmed is None else trimmed)
-        if dropped:
-            _trim_qsa_indexer(_entry, dropped)
-        else:
+        entry.trim = trim
+
+    orig_filter = getattr(entry, "filter", None)
+    if callable(orig_filter):
+        def filter(batch_indices: Any, _orig=orig_filter, _entry=entry):
+            res = _orig(batch_indices)
+            indexer = getattr(_entry, "indexer", None)
+            if indexer is not None and hasattr(indexer, "filter"):
+                indexer.filter(batch_indices)
             reuse = getattr(_entry, "_sparse_index_reuse", None)
             if reuse is not None and hasattr(reuse, "reset"):
                 reuse.reset()
-        return trimmed
+            return res
 
-    entry.trim = trim
+        entry.filter = filter
+
+    orig_extend = getattr(entry, "extend", None)
+    if callable(orig_extend):
+        def extend(other: Any, _orig=orig_extend, _entry=entry):
+            res = _orig(other)
+            indexer = getattr(_entry, "indexer", None)
+            other_indexer = getattr(other, "indexer", None)
+            if indexer is not None and hasattr(indexer, "extend"):
+                indexer.extend(other_indexer)
+            reuse = getattr(_entry, "_sparse_index_reuse", None)
+            if reuse is not None and hasattr(reuse, "reset"):
+                reuse.reset()
+            return res
+
+        entry.extend = extend
+
+    orig_extract = getattr(entry, "extract", None)
+    if callable(orig_extract):
+        def extract(idx: int, _orig=orig_extract, _entry=entry):
+            res = _orig(idx)
+            indexer = getattr(_entry, "indexer", None)
+            if indexer is not None and hasattr(indexer, "extract"):
+                res.indexer = indexer.extract(idx)
+                _install_indexer_aware_trim(res)
+            return res
+
+        entry.extract = extract
+
     entry._mtplx_indexer_trim = True
     return entry
 
@@ -1269,6 +1309,8 @@ def inject_qwen4_exp_mtp_support(
                 len(missing),
                 missing[:8],
             )
+            if not allow_random_init:
+                return False
         if extra:
             logger.warning(
                 "[Qwen4Exp MTP inject] %d sidecar keys unused (first %s)",
