@@ -477,3 +477,111 @@ def test_mtp_forward_routes_through_installed_draft_head(tmp_path):
     assert float(logits[0, 0, 0].item()) == 42.0
 
 
+def test_forward_logits_controls_through_qwen4_wrapper(tmp_path):
+    import mlx.nn as nn
+    from mtplx.models.qwen4_exp import Model, ModelArgs, TextArgs
+    from mtplx.qwen4_exp_mtp_patch import inject_qwen4_exp_mtp_support
+
+    config = {
+        "model_type": "qwen4_exp",
+        "hidden_size": 128,
+        "num_hidden_layers": 4,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 2,
+        "head_dim": 32,
+        "mtp_num_hidden_layers": 1,
+        "hc_count": 2,
+        "hc_lowrank": 64,
+        "vocab_size": 50,
+    }
+
+    model = Model(ModelArgs.from_dict(config))
+    inject_qwen4_exp_mtp_support(model, str(tmp_path), config, allow_random_init=True)
+
+    toks = mx.array([[1, 2, 3, 4]])
+    cache = model.make_cache()
+
+    # 1. emit_logits=False
+    out = model(toks, cache=cache, emit_logits=False)
+    assert out is None
+
+    out_h = model(toks, cache=cache, emit_logits=False, return_hidden=True)
+    assert out_h[0] is None
+    assert out_h[1] is not None
+
+    # 2. logits_keep=1
+    out_k1 = model(toks, cache=cache, logits_keep=1)
+    assert out_k1 is not None
+    assert out_k1.shape == (1, 1, 50)
+
+    out_k1_h = model(toks, cache=cache, logits_keep=1, return_hidden=True)
+    assert out_k1_h[0] is not None
+    assert out_k1_h[0].shape == (1, 1, 50)
+
+
+def test_recurrent_mask_built_for_padded_qwen4_batches():
+    from mtplx.models.qwen4_exp import Model, ModelArgs
+    from mtplx.qwen4_exp_mtp_patch import Qwen4ExpRecurrentCache, wrap_qwen4_exp_cache
+
+    config = {
+        "model_type": "qwen4_exp",
+        "hidden_size": 128,
+        "num_hidden_layers": 4,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 2,
+        "head_dim": 32,
+        "vocab_size": 50,
+    }
+
+    model = Model(ModelArgs.from_dict(config))
+    cache = model.make_cache()
+    # Install left padding on recurrent cache (batch of 2 sequences, first has 2 pad tokens)
+    left_padding = mx.array([2, 0])
+    wrapped_cache = wrap_qwen4_exp_cache(cache, model.model)
+    for c in wrapped_cache:
+        if isinstance(c, Qwen4ExpRecurrentCache):
+            c.left_padding = left_padding
+
+    toks = mx.array([[0, 0, 5, 6], [7, 8, 9, 10]])
+    logits = model(toks, cache=wrapped_cache)
+    assert logits is not None
+    assert logits.shape == (2, 4, 50)
+
+
+def test_avoid_double_shifting_mlx_mtp_norms(tmp_path):
+    from mtplx.qwen4_exp_mtp_patch import _load_mtp_weights, _shift_qwen4_gemma_mtp_norms
+
+    # 1. Delta-encoded norm weights (mean around 0.0) -> should be shifted (+1.0)
+    delta_weights = {
+        "pre_fc_norm_embedding.weight": mx.zeros((128,)),
+        "pre_fc_norm_hidden.weight": mx.zeros((128,)),
+        "layers.0.self_attn.q_norm.weight": mx.zeros((32,)),
+    }
+    shifted = _shift_qwen4_gemma_mtp_norms(delta_weights)
+    assert float(shifted["pre_fc_norm_embedding.weight"].mean().item()) == 1.0
+    assert float(shifted["pre_fc_norm_hidden.weight"].mean().item()) == 1.0
+
+    # 2. Already shifted / absolute norm weights (mean around 1.0) -> should NOT be shifted
+    already_shifted = {
+        "pre_fc_norm_embedding.weight": mx.ones((128,)),
+        "pre_fc_norm_hidden.weight": mx.ones((128,)),
+        "layers.0.self_attn.q_norm.weight": mx.ones((32,)),
+    }
+    not_double_shifted = _shift_qwen4_gemma_mtp_norms(already_shifted)
+    assert float(not_double_shifted["pre_fc_norm_embedding.weight"].mean().item()) == 1.0
+
+    # 3. Safetensors file saved with format='mlx' metadata -> should NOT be shifted
+    sf_path = tmp_path / "mtp.safetensors"
+    mx.save_safetensors(
+        str(sf_path),
+        {
+            "mtp.pre_fc_norm_embedding.weight": mx.ones((128,)),
+            "mtp.pre_fc_norm_hidden.weight": mx.ones((128,)),
+        },
+        metadata={"format": "mlx"},
+    )
+    loaded = _load_mtp_weights([sf_path])
+    assert float(loaded["pre_fc_norm_embedding.weight"].mean().item()) == 1.0
+
+
+

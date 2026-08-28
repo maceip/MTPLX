@@ -21,6 +21,7 @@ import mlx.nn as nn
 from mlx_lm.models.base import (
     BaseModelArgs,
     create_attention_mask,
+    create_ssm_mask,
     scaled_dot_product_attention,
 )
 from mlx_lm.models.cache import ArraysCache, KVCache, _BaseCache
@@ -1329,6 +1330,10 @@ class Qwen4ExpModel(nn.Module):
             (i for i, l in enumerate(self.layers) if l.layer_type == "full_attention"),
             None,
         )
+        self.first_linear_attn_idx = next(
+            (i for i, l in enumerate(self.layers) if l.layer_type == "linear_attention"),
+            None,
+        )
         self.ple_layers = [
             i for i in range(args.num_hidden_layers) if (i + 1) in args.ple_layer_ids
         ]
@@ -1361,7 +1366,21 @@ class Qwen4ExpModel(nn.Module):
         mask = create_attention_mask(
             h, [attn_cache] if attn_cache is not None else None
         )
-        conv_mask = None
+        linear_cache = (
+            cache[self.first_linear_attn_idx]
+            if (
+                self.first_linear_attn_idx is not None
+                and len(cache) > self.first_linear_attn_idx
+                and cache[self.first_linear_attn_idx] is not None
+            )
+            else None
+        )
+        if linear_cache is None:
+            linear_cache = next(
+                (c for c in cache if c is not None and hasattr(c, "make_mask")),
+                None,
+            )
+        conv_mask = create_ssm_mask(h, linear_cache)
 
         prev_ctx = None
         if self.ple_layers and ids is not None:

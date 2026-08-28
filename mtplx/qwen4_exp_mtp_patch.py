@@ -185,14 +185,25 @@ def _load_mtp_weights(paths: list[Path]) -> dict[str, Any]:
     import mlx.core as mx
 
     mapped: dict[str, Any] = {}
+    is_mlx_format = False
     for path in paths:
         if path.suffix != ".safetensors":
             continue
-        for key, value in mx.load(str(path)).items():
+        try:
+            loaded, metadata = mx.load(str(path), return_metadata=True)
+            if isinstance(metadata, dict) and str(metadata.get("format", "")).lower() == "mlx":
+                is_mlx_format = True
+        except Exception:
+            loaded = mx.load(str(path))
+            metadata = None
+        for key, value in loaded.items():
             local = _strip_mtp_prefix(key)
             if local is not None:
                 mapped[local] = value
-    return _shift_qwen4_gemma_mtp_norms(_remap_mtp_moe_weights(mapped))
+    remapped = _remap_mtp_moe_weights(mapped)
+    if is_mlx_format:
+        return remapped
+    return _shift_qwen4_gemma_mtp_norms(remapped)
 
 
 # Qwen4ExpTextRMSNorm is Gemma-style ``(1 + weight)`` with zero init. MLX
@@ -228,8 +239,12 @@ def _remap_mtp_moe_weights(weights: dict[str, Any]) -> dict[str, Any]:
     return remap(dict(weights))
 
 
-def _shift_qwen4_gemma_mtp_norms(weights: dict[str, Any]) -> dict[str, Any]:
+def _shift_qwen4_gemma_mtp_norms(
+    weights: dict[str, Any], metadata: dict[str, Any] | None = None
+) -> dict[str, Any]:
     """Restore MLX-absolute RMSNorm gains on a raw-HF qwen4_exp MTP sidecar."""
+    if metadata and str(metadata.get("format", "")).lower() == "mlx":
+        return weights
     targets = [
         (key, value)
         for key, value in weights.items()
@@ -238,6 +253,22 @@ def _shift_qwen4_gemma_mtp_norms(weights: dict[str, Any]) -> dict[str, Any]:
     ]
     if not targets:
         return weights
+    for key, value in targets:
+        if str(key).endswith("pre_fc_norm_embedding.weight") or str(key).endswith(
+            "pre_fc_norm_hidden.weight"
+        ):
+            try:
+                if float(value.mean().item()) > 0.5:
+                    return weights
+            except Exception:
+                pass
+    try:
+        means = [float(v.mean().item()) for _, v in targets]
+        if sum(means) / len(means) > 0.5:
+            return weights
+    except Exception:
+        pass
+
     out = dict(weights)
     for key, value in targets:
         out[key] = value + 1.0
@@ -738,10 +769,13 @@ def _sequential_owner_forward(
     return_hidden: bool,
     hidden_variant: str | None,
     input_embeddings=None,
+    **kwargs,
 ):
     import mlx.core as mx
 
     del hidden_variant, input_embeddings
+    emit_logits = kwargs.get("emit_logits", True)
+    logits_keep = kwargs.get("logits_keep", None)
     length = int(inputs.shape[1])
     logits_steps = []
     hidden_steps = []
@@ -751,14 +785,20 @@ def _sequential_owner_forward(
         step = inputs[:, t : t + 1]
         if return_hidden:
             last_logits, last_hidden = owner(
-                step, cache=cache, return_hidden=True
+                step, cache=cache, return_hidden=True, emit_logits=emit_logits
             )
-            logits_steps.append(last_logits)
+            if emit_logits and last_logits is not None:
+                logits_steps.append(last_logits)
             hidden_steps.append(last_hidden)
         else:
-            last_logits = owner(step, cache=cache, return_hidden=False)
-            logits_steps.append(last_logits)
-    logits = mx.concatenate(logits_steps, axis=1)
+            last_logits = owner(
+                step, cache=cache, return_hidden=False, emit_logits=emit_logits
+            )
+            if emit_logits and last_logits is not None:
+                logits_steps.append(last_logits)
+    logits = mx.concatenate(logits_steps, axis=1) if emit_logits and logits_steps else None
+    if logits is not None and logits_keep is not None:
+        logits = logits[:, -max(1, int(logits_keep)) :, :]
     if not return_hidden:
         return logits
     hidden = mx.concatenate(hidden_steps, axis=1)
@@ -1196,15 +1236,23 @@ def inject_qwen4_exp_mtp_support(
                     cache,
                     return_hidden=return_hidden,
                     hidden_variant=hidden_variant,
+                    **kwargs,
                 )
             if not return_hidden:
                 return super().__call__(
-                    inputs, cache=cache, input_embeddings=input_embeddings
+                    inputs, cache=cache, input_embeddings=input_embeddings, **kwargs
                 )
             mixed, hyper = self.model(
                 inputs, cache, input_embeddings, return_hyper=True
             )
-            logits = self._lm_logits(mixed)
+            emit_logits = kwargs.get("emit_logits", True)
+            logits_keep = kwargs.get("logits_keep", None)
+            if not emit_logits:
+                return None, hyper
+            out = mixed
+            if logits_keep is not None:
+                out = out[:, -max(1, int(logits_keep)) :, :]
+            logits = self._lm_logits(out)
             return logits, hyper
 
         def make_cache(self):
