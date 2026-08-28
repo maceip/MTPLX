@@ -584,4 +584,44 @@ def test_avoid_double_shifting_mlx_mtp_norms(tmp_path):
     assert float(loaded["pre_fc_norm_embedding.weight"].mean().item()) == 1.0
 
 
+def test_short_cache_and_custom_cache_slot_resilience():
+    from mtplx.models.qwen4_exp import GatedDeltaNet, PLELayer, TextArgs
+
+    args = TextArgs(
+        hidden_size=128,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=32,
+        linear_num_key_heads=4,
+        linear_num_value_heads=4,
+        linear_key_head_dim=32,
+        linear_value_head_dim=32,
+        linear_conv_kernel_dim=4,
+        hc_count=2,
+        hc_lowrank=64,
+        ple_embed_dim=128,
+        ple_layer_ids=[1],
+        ngram_size=3,
+        ple_conv_kernel_size=4,
+        layer_types=["linear_attention", "linear_attention"],
+    )
+
+    # 1. Test GatedDeltaNet with a plain 2-element list (no .advance method)
+    gdn = GatedDeltaNet(args)
+    plain_list_cache = [None, None]
+    x = mx.ones((1, 1, 128))
+    out = gdn(x, mask=None, cache=plain_list_cache)
+    assert out is not None
+    assert plain_list_cache[0] is not None
+    assert plain_list_cache[1] is not None
+
+    # 2. Test PLELayer with a 2-element list (shorter than index 2)
+    ple = PLELayer(args, ple_layer_index=0)
+    x_ple = mx.ones((1, 1, 256))
+    out_ple = ple._short_conv(x_ple, plain_list_cache)
+    assert out_ple is not None
+
+
+
 

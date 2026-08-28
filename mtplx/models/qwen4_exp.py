@@ -262,6 +262,26 @@ class RotaryEmbedding:
         return mx.cos(emb) * self.mscale, mx.sin(emb) * self.mscale
 
 
+def _cache_slot(cache: Any, idx: int) -> Any:
+    if cache is None:
+        return None
+    try:
+        if hasattr(cache, "__len__") and len(cache) <= idx:
+            return None
+        return cache[idx]
+    except (IndexError, TypeError, KeyError):
+        return None
+
+
+def _set_cache_slot(cache: Any, idx: int, value: Any) -> None:
+    if cache is None:
+        return
+    try:
+        cache[idx] = value
+    except (IndexError, TypeError, KeyError):
+        pass
+
+
 def _l2norm(x: mx.array, eps: float = 1e-6) -> mx.array:
     inv_norm = mx.rsqrt(mx.sum(x * x, axis=-1, keepdims=True) + eps)
     return x * inv_norm
@@ -438,9 +458,10 @@ def _qsa_gather_attention(
             m = mx.broadcast_to(m, (B, m.shape[1], m.shape[2], m.shape[3]))
         if m.shape[2] != S and m.shape[2] == 1:
             m = mx.broadcast_to(m, (m.shape[0], m.shape[1], S, m.shape[3]))
-        idx = safe[:, None, :, :]
+        safe_mask = mx.clip(safe, 0, max(int(m.shape[-1]) - 1, 0))
+        idx = safe_mask[:, None, :, :]
         if m.shape[1] > 1:
-            idx = mx.broadcast_to(idx, (B, m.shape[1], S, safe.shape[-1]))
+            idx = mx.broadcast_to(idx, (B, m.shape[1], S, safe_mask.shape[-1]))
         mask_gathered = mx.take_along_axis(m, idx, axis=-1)
 
     if H != H_kv:
@@ -860,16 +881,19 @@ class GatedDeltaNet(nn.Module):
         z = z.reshape(B, S, self.n_v, self.dv)
         b, a = mx.split(self.in_proj_ba(x), [self.n_v], axis=-1)
 
+        slot0 = _cache_slot(cache, 0) if cache is not None else None
         conv_state = (
-            cache[0]
-            if (cache is not None and cache[0] is not None)
+            slot0
+            if slot0 is not None
             else mx.zeros((B, self.conv_kernel_size - 1, self.conv_dim), dtype=x.dtype)
         )
         if mask is not None:
             mixed_qkv = mx.where(mask[..., None], mixed_qkv, 0)
         conv_input = mx.concatenate([conv_state, mixed_qkv], axis=1)
         if cache is not None:
-            cache[0] = mx.contiguous(conv_input[:, -(self.conv_kernel_size - 1) :, :])
+            _set_cache_slot(
+                cache, 0, mx.contiguous(conv_input[:, -(self.conv_kernel_size - 1) :, :])
+            )
         conv_out = nn.silu(self.conv1d(conv_input))
 
         q, k, v = mx.split(conv_out, [self.key_dim, 2 * self.key_dim], axis=-1)
@@ -880,11 +904,12 @@ class GatedDeltaNet(nn.Module):
         q = mx.fast.rms_norm(q, None, self._l2_eps) * self._inv_scale_sq
         k = mx.fast.rms_norm(k, None, self._l2_eps) * self._inv_scale
 
-        state = cache[1] if cache is not None else None
+        state = _cache_slot(cache, 1) if cache is not None else None
         out, state = self._gated_delta_update(q, k, v, a, b, state, mask)
         if cache is not None:
-            cache[1] = state
-            cache.advance(S)
+            _set_cache_slot(cache, 1, state)
+            if hasattr(cache, "advance"):
+                cache.advance(S)
         return self.out_proj(self.norm(out, z).reshape(B, S, -1))
 
     def _gated_delta_update(
@@ -1228,18 +1253,15 @@ class PLELayer(nn.Module):
     def _short_conv(self, x: mx.array, cache: Any) -> mx.array:
         S = x.shape[1]
         n = self.short_conv_state_len
-        has_cache_slots = cache is not None and (
-            isinstance(cache, (list, tuple, ArraysCache))
-            or (hasattr(cache, "__getitem__") and hasattr(cache, "__setitem__"))
-        )
+        slot = _cache_slot(cache, 2)
         state = (
-            cache[2]
-            if (has_cache_slots and cache[2] is not None)
+            slot
+            if slot is not None
             else mx.zeros((x.shape[0], n, x.shape[-1]), dtype=x.dtype)
         )
         full = mx.concatenate([state, x], axis=1)
-        if has_cache_slots:
-            cache[2] = mx.contiguous(full[:, -n:, :])
+        if cache is not None:
+            _set_cache_slot(cache, 2, mx.contiguous(full[:, -n:, :]))
         return nn.silu(self.conv1d(full[:, -(n + S) :, :]))
 
     def __call__(
@@ -1388,19 +1410,15 @@ class Qwen4ExpModel(nn.Module):
             eos = self.args.eos_token_id
             eos = eos[0] if isinstance(eos, list) else eos
             pc = cache[self.ple_layers[0]] if len(cache) > self.ple_layers[0] else None
-            has_slots = pc is not None and (
-                isinstance(pc, (list, tuple, ArraysCache))
-                or (hasattr(pc, "__getitem__") and hasattr(pc, "__setitem__"))
-            )
-            prev = pc[3] if has_slots else None
+            prev = _cache_slot(pc, 3)
             prev_ctx = (
                 prev
                 if prev is not None
                 else mx.full((ids.shape[0], ctx_len), eos, ids.dtype)
             )
-            if has_slots:
+            if pc is not None:
                 tail = mx.concatenate([prev_ctx, ids], axis=1)[:, -ctx_len:]
-                pc[3] = tail
+                _set_cache_slot(pc, 3, tail)
 
         h = mx.tile(h, (1, 1, self.hc))
         if _compile_enabled() and (
