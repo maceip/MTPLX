@@ -42,7 +42,6 @@ _REFERENCE_QWEN4_EXP = Path("/tmp/mlx-lm-pr1788/mlx_lm/models/qwen4_exp.py")
 _MTP_ALIAS = {
     "enorm.weight": "pre_fc_norm_embedding.weight",
     "hnorm.weight": "pre_fc_norm_hidden.weight",
-    "eh_proj.weight": "fc.weight",
     "final_layernorm.weight": "norm.weight",
     "shared_head_norm.weight": "norm.weight",
 }
@@ -181,6 +180,43 @@ def _candidate_weight_files(model_path: Path, config: dict[str, Any]) -> list[Pa
     return sorted(model_path.glob("model*.safetensors"))
 
 
+def _split_eh_proj_weights(weights: dict[str, Any]) -> dict[str, Any]:
+    import mlx.core as mx
+
+    out = dict(weights)
+    keys = list(out.keys())
+    for k in keys:
+        if "eh_proj." in k or k.startswith("fc.") or ".fc." in k:
+            val = out.pop(k)
+            for name in ("eh_proj.", "fc."):
+                if name in k:
+                    prefix, suffix = k.split(name, 1)
+                    break
+            else:
+                prefix = ""
+                suffix = k
+
+            if (
+                getattr(val, "shape", None)
+                and len(val.shape) >= 2
+                and val.shape[-1] % 2 == 0
+            ):
+                e_val, h_val = mx.split(val, 2, axis=-1)
+                out[f"{prefix}fc_embedding.{suffix}"] = e_val
+                out[f"{prefix}fc_hidden.{suffix}"] = h_val
+            elif (
+                getattr(val, "shape", None)
+                and len(val.shape) == 1
+                and val.shape[0] % 2 == 0
+            ):
+                e_val, h_val = mx.split(val, 2, axis=0)
+                out[f"{prefix}fc_embedding.{suffix}"] = e_val
+                out[f"{prefix}fc_hidden.{suffix}"] = h_val
+            else:
+                out[k] = val
+    return out
+
+
 def _process_raw_mtp_weights(
     raw: dict[str, Any], is_mlx_format: bool = False
 ) -> dict[str, Any]:
@@ -192,6 +228,7 @@ def _process_raw_mtp_weights(
         else:
             mapped[key] = value
     remapped = _remap_mtp_moe_weights(mapped)
+    remapped = _split_eh_proj_weights(remapped)
     if is_mlx_format:
         return remapped
     return _shift_qwen4_gemma_mtp_norms(remapped)
@@ -217,6 +254,7 @@ def _load_mtp_weights(paths: list[Path]) -> dict[str, Any]:
             if local is not None:
                 mapped[local] = value
     remapped = _remap_mtp_moe_weights(mapped)
+    remapped = _split_eh_proj_weights(remapped)
     if is_mlx_format:
         return remapped
     return _shift_qwen4_gemma_mtp_norms(remapped)
@@ -1294,7 +1332,8 @@ def inject_qwen4_exp_mtp_support(
 ) -> bool:
     """Attach the qwen4_exp MTP head and the draft/verify/rollback surface."""
     import mlx.core as mx
-    from mlx_lm.models.base import create_attention_mask
+    from mlx_lm.models.base import create_attention_mask, create_ssm_mask
+    from mlx_lm.models.cache import ArraysCache
 
     if not is_qwen4_exp_mtp_config(config) and not (
         allow_random_init and is_qwen4_exp_config(config)
@@ -1469,6 +1508,7 @@ def inject_qwen4_exp_mtp_support(
             position_offset: int | None = None,
             mtp_depth: int | None = None,
             reuse_sparse_indices: bool | None = None,
+            input_embeddings=None,
         ):
             del mtp_hidden_variant, concat_order
             layer_caches = mtp_cache if mtp_cache is not None else self.make_mtp_cache()
@@ -1489,9 +1529,14 @@ def inject_qwen4_exp_mtp_support(
             #   h = fc_hidden(h)   # shared Linear(H,H) per stream
             #   x = e.unsqueeze(-2) + h ; flatten to [T, hc*H]
             # Mean-collapse-then-tile was the zero-accept assembly bug.
-            e = self.mtp.fc_embedding(
-                self.mtp.pre_fc_norm_embedding(self._embed(next_token_ids))
-            )
+            if input_embeddings is not None:
+                e = self.mtp.fc_embedding(
+                    self.mtp.pre_fc_norm_embedding(input_embeddings)
+                )
+            else:
+                e = self.mtp.fc_embedding(
+                    self.mtp.pre_fc_norm_embedding(self._embed(next_token_ids))
+                )
             h = self.mtp.pre_fc_norm_hidden(hidden_states)
             h = h.reshape(*h.shape[:-1], hc, d)
             h = self.mtp.fc_hidden(h)
@@ -1509,14 +1554,56 @@ def inject_qwen4_exp_mtp_support(
                         except Exception:
                             pass
             if rope_shift:
-                attn_cache = layer_caches[0] if layer_caches else None
+                attn_cache = next(
+                    (
+                        c
+                        for l, c in zip(self.mtp.layers, layer_caches)
+                        if (
+                            getattr(l, "layer_type", None) != "linear_attention"
+                            and not hasattr(l, "linear_attn")
+                        )
+                        and c is not None
+                        and getattr(c, "offset", None) is not None
+                    ),
+                    None,
+                )
                 local = int(getattr(attn_cache, "offset", 0) or 0)
                 self.mtp.rope_shift = rope_shift - local
             else:
                 self.mtp.rope_shift = 0
-            attn_cache = layer_caches[0] if layer_caches else None
+            attn_cache = next(
+                (
+                    c
+                    for l, c in zip(self.mtp.layers, layer_caches)
+                    if (
+                        getattr(l, "layer_type", None) != "linear_attention"
+                        and not hasattr(l, "linear_attn")
+                    )
+                    and c is not None
+                    and getattr(c, "offset", None) is not None
+                ),
+                None,
+            )
             mask = create_attention_mask(
                 e, [attn_cache] if attn_cache is not None else None
+            )
+            linear_cache = next(
+                (
+                    c
+                    for l, c in zip(self.mtp.layers, layer_caches)
+                    if (
+                        getattr(l, "layer_type", None) == "linear_attention"
+                        or hasattr(l, "linear_attn")
+                    )
+                    and c is not None
+                    and hasattr(c, "make_mask")
+                ),
+                None,
+            )
+            conv_mask = (
+                create_ssm_mask(e, linear_cache)
+                if linear_cache is not None
+                else None
             )
             ids = next_token_ids
             for layer, layer_cache in zip(self.mtp.layers, layer_caches):
@@ -1529,7 +1616,7 @@ def inject_qwen4_exp_mtp_support(
                     x,
                     self.mtp.rope,
                     mask,
-                    None,
+                    conv_mask,
                     layer_cache,
                     idx_c,
                     ids,
@@ -1549,6 +1636,7 @@ def inject_qwen4_exp_mtp_support(
             concat_order=None,
             position_offset: int | None = None,
             mtp_depth: int | None = None,
+            input_embeddings=None,
         ):
             _logits, hidden = self.mtp_forward(
                 hidden_states,
@@ -1558,18 +1646,26 @@ def inject_qwen4_exp_mtp_support(
                 return_hidden=True,
                 position_offset=position_offset,
                 mtp_depth=mtp_depth,
+                input_embeddings=input_embeddings,
             )
             return hidden
 
         def make_mtp_cache(self):
             caches = []
             for layer in self.mtp.layers:
-                entry = _install_indexer_aware_trim(_make_attn_cache(qwen4))
-                attn = getattr(layer, "self_attn", None)
-                indexer = getattr(attn, "indexer", None)
-                if isinstance(indexer, SparseIndexReuse):
-                    entry._sparse_index_reuse = indexer
-                caches.append(entry)
+                is_linear = (
+                    getattr(layer, "layer_type", None) == "linear_attention"
+                    or hasattr(layer, "linear_attn")
+                )
+                if is_linear:
+                    caches.append(ArraysCache(4))
+                else:
+                    entry = _install_indexer_aware_trim(_make_attn_cache(qwen4))
+                    attn = getattr(layer, "self_attn", None)
+                    indexer = getattr(attn, "indexer", None)
+                    if isinstance(indexer, SparseIndexReuse):
+                        entry._sparse_index_reuse = indexer
+                    caches.append(entry)
             return caches
 
         def snapshot_state(self, cache, *, copy: bool = False) -> StateSnapshot:

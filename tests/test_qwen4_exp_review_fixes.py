@@ -1359,6 +1359,211 @@ def test_temperature_scaling_in_sampling_and_verification():
     assert decision.accepted
 
 
+def test_moe_routing_policy_norm_topk_and_scaling_factor():
+    from mtplx.models.qwen4_exp import SparseMoeBlock, TextArgs
+
+    config = {
+        "hidden_size": 64,
+        "num_experts": 8,
+        "num_experts_per_tok": 2,
+        "moe_intermediate_size": 32,
+        "shared_expert_intermediate_size": 32,
+        "norm_topk_prob": False,
+        "routed_scaling_factor": 2.5,
+    }
+    args = TextArgs.from_dict(config)
+    assert args.norm_topk_prob is False
+    assert args.routed_scaling_factor == 2.5
+
+    block = SparseMoeBlock(args)
+    assert block.norm_topk_prob is False
+    assert block.routed_scaling_factor == 2.5
+
+    x = mx.ones((1, 2, 64))
+    out = block(x)
+    assert out.shape == (1, 2, 64)
+
+
+def test_qsa_indexer_excludes_partially_padded_blocks():
+    from mtplx.models.qwen4_exp import QSAIndexer, TextArgs
+
+    args = TextArgs(
+        hidden_size=64,
+        indexer_n_heads=2,
+        indexer_head_dim=32,
+        indexer_budget=8,
+        indexer_compress_ratio=4,
+    )
+    indexer = QSAIndexer(args)
+    indexer.block_topk = 1
+
+    # Left padding is 3 (less than compress_ratio 4, so block 0 is partially padded)
+    left_padding = mx.array([3])
+    q = mx.ones((1, 1, 2, 32))
+    q_pos = mx.array([8])
+    pooled = mx.ones((1, 3, 32))  # 3 blocks: block 0 (0..3), block 1 (4..7), block 2 (8..11)
+
+    sel = indexer.select(q, q_pos, pooled, kv_len=12, left_padding=left_padding)
+    # Block 0 starts at 0 < 3 (padding), so valid_block for block 0 is False.
+    # Selected top-k block should be block 1 (tokens 4..7), NOT block 0.
+    selected_block_tokens = sel.token_idx[0, 0, :4].tolist()
+    assert selected_block_tokens == [4, 5, 6, 7]
+    assert sel.valid[0, 0, :4].tolist() == [True, True, True, True]
+
+
+def test_preserve_conv_state_across_masked_timesteps():
+    from mtplx.models.qwen4_exp import GatedDeltaNet, PLELayer, TextArgs
+    from mlx_lm.models.cache import ArraysCache
+
+    args = TextArgs(
+        hidden_size=64,
+        linear_num_key_heads=2,
+        linear_num_value_heads=2,
+        linear_key_head_dim=32,
+        linear_value_head_dim=32,
+        linear_conv_kernel_dim=4,
+        hc_count=2,
+        ple_embed_dim=64,
+        ple_conv_kernel_size=4,
+        ngram_size=2,
+    )
+
+    # 1. GDN test
+    gdn = GatedDeltaNet(args)
+    cache = ArraysCache(4)
+    init_conv = mx.array([[[1.0] * gdn.conv_dim] * (gdn.conv_kernel_size - 1), [[2.0] * gdn.conv_dim] * (gdn.conv_kernel_size - 1)])
+    cache[0] = init_conv
+
+    x = mx.ones((2, 1, 64))
+    # Row 0 is masked (False), Row 1 is active (True)
+    mask = mx.array([[False], [True]])
+    _ = gdn(x, mask=mask, cache=cache)
+
+    # Row 0 must preserve original convolution state (not shifted with zeros)
+    assert mx.array_equal(cache[0][0], init_conv[0])
+    # Row 1 advanced
+    assert not mx.array_equal(cache[0][1], init_conv[1])
+
+    # 2. PLE test
+    ple = PLELayer(args, ple_layer_index=0)
+    ple_cache = ArraysCache(4)
+    init_ple_conv = mx.array([[[5.0] * (args.hidden_size * args.hc_count)] * ple.short_conv_state_len, [[6.0] * (args.hidden_size * args.hc_count)] * ple.short_conv_state_len])
+    ple_cache[2] = init_ple_conv
+
+    x_ple = mx.ones((2, 1, args.hidden_size * args.hc_count))
+    _ = ple._short_conv(x_ple, ple_cache, mask=mask)
+
+    # Row 0 must preserve original PLE convolution state
+    assert mx.array_equal(ple_cache[2][0], init_ple_conv[0])
+    # Row 1 advanced
+    assert not mx.array_equal(ple_cache[2][1], init_ple_conv[1])
+
+
+def test_accept_spliced_input_embeddings_in_mtp_history_update():
+    from mtplx.models.qwen4_exp import Model, ModelArgs
+    from mtplx.qwen4_exp_mtp_patch import inject_qwen4_exp_mtp_support
+
+    config = {
+        "model_type": "qwen4_exp",
+        "hidden_size": 128,
+        "num_hidden_layers": 4,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 2,
+        "head_dim": 32,
+        "hc_count": 2,
+        "hc_lowrank": 64,
+        "rope_parameters": {},
+        "layer_types": ["linear_attention", "linear_attention", "linear_attention", "full_attention"],
+        "full_attention_interval": 4,
+        "vocab_size": 50,
+        "mtp_num_hidden_layers": 1,
+    }
+    args = ModelArgs.from_dict(config)
+    model = Model(args)
+    injected = inject_qwen4_exp_mtp_support(model, None, config=config, allow_random_init=True)
+    assert injected
+
+    # Verify mtp_update_cache accepts input_embeddings keyword argument
+    hidden_states = mx.ones((1, 2, 128 * 2))
+    next_tokens = mx.array([[10, 20]], dtype=mx.int32)
+    spliced_emb = mx.ones((1, 2, 128))
+
+    res = model.mtp_update_cache(
+        hidden_states,
+        next_tokens,
+        input_embeddings=spliced_emb,
+    )
+    assert res.shape == (1, 2, 128 * 2)
+
+
+def test_allocate_recurrent_caches_for_linear_mtp_layers():
+    from mtplx.models.qwen4_exp import Model, ModelArgs
+    from mtplx.qwen4_exp_mtp_patch import inject_qwen4_exp_mtp_support
+    from mlx_lm.models.cache import ArraysCache
+
+    config = {
+        "model_type": "qwen4_exp",
+        "hidden_size": 128,
+        "num_hidden_layers": 4,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 2,
+        "head_dim": 32,
+        "hc_count": 2,
+        "hc_lowrank": 64,
+        "rope_parameters": {},
+        "layer_types": ["linear_attention", "linear_attention", "linear_attention", "full_attention"],
+        "full_attention_interval": 4,
+        "vocab_size": 50,
+        "mtp_num_hidden_layers": 1,
+        "mtp": {
+            "num_hidden_layers": 1,
+            "layer_types": ["linear_attention"],
+        },
+    }
+    args = ModelArgs.from_dict(config)
+    model = Model(args)
+    injected = inject_qwen4_exp_mtp_support(model, None, config=config, allow_random_init=True)
+    assert injected
+
+    mtp_cache = model.make_mtp_cache()
+    assert len(mtp_cache) == 1
+    assert isinstance(mtp_cache[0], ArraysCache)
+
+    # mtp_forward executes and updates recurrent cache
+    hidden_states = mx.ones((1, 1, 128 * 2))
+    next_tokens = mx.array([[10]], dtype=mx.int32)
+    logits, next_h = model.mtp_forward(
+        hidden_states,
+        next_tokens,
+        mtp_cache=mtp_cache,
+        return_hidden=True,
+    )
+    assert logits.shape[-1] == 50
+    assert next_h.shape == (1, 1, 128 * 2)
+    # Check that GDN conv_state and recurrent state in mtp_cache were written
+    assert mtp_cache[0][0] is not None
+    assert mtp_cache[0][1] is not None
+
+
+def test_split_fused_eh_proj_weights():
+    from mtplx.qwen4_exp_mtp_patch import _process_raw_mtp_weights, inject_qwen4_exp_mtp_support
+    from mtplx.models.qwen4_exp import Model, ModelArgs
+
+    raw_weights = {
+        "mtp.pre_fc_norm_embedding.weight": mx.ones((128,)),
+        "mtp.pre_fc_norm_hidden.weight": mx.ones((256,)),
+        "mtp.eh_proj.weight": mx.ones((128, 256)),
+    }
+    processed = _process_raw_mtp_weights(raw_weights)
+    assert "fc_embedding.weight" in processed
+    assert "fc_hidden.weight" in processed
+    assert processed["fc_embedding.weight"].shape == (128, 128)
+    assert processed["fc_hidden.weight"].shape == (128, 128)
+    assert "eh_proj.weight" not in processed
+    assert "fc.weight" not in processed
+
+
+
 
 
 

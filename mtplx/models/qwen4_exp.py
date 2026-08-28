@@ -72,6 +72,8 @@ class TextArgs(BaseModelArgs):
     num_experts_per_tok: int = 10
     moe_intermediate_size: int = 640
     shared_expert_intermediate_size: int = 640
+    norm_topk_prob: bool = True
+    routed_scaling_factor: float = 1.0
     # Gated DeltaNet
     linear_num_key_heads: int = 16
     linear_num_value_heads: int = 48
@@ -130,6 +132,16 @@ class TextArgs(BaseModelArgs):
             if "type" in rp and "rope_type" not in rp:
                 rp["rope_type"] = rp["type"]
             params["rope_parameters"] = rp
+        if "norm_topk_prob" in params:
+            params["norm_topk_prob"] = bool(params["norm_topk_prob"])
+        for k in (
+            "routed_scaling_factor",
+            "moe_routed_scaling_factor",
+            "router_scaling_factor",
+        ):
+            if k in params:
+                params["routed_scaling_factor"] = float(params[k])
+                break
         return super().from_dict(params)
 
 
@@ -579,6 +591,10 @@ class QSAIndexer(nn.Module):
             return None
 
         r = self.compress_ratio
+        left_padding = getattr(cache, "left_padding", None)
+        if left_padding is None and hasattr(cache, "indexer"):
+            left_padding = getattr(cache.indexer, "left_padding", None)
+
         if cache is not None:
             cached_pooled = getattr(cache, "pooled", None)
             n_cached = int(cached_pooled.shape[1]) if cached_pooled is not None else 0
@@ -589,10 +605,26 @@ class QSAIndexer(nn.Module):
             if n_cached < n_blocks:
                 new_raw_k = raw_k[:, n_cached * r : n_blocks * r, :]
                 n_new = n_blocks - n_cached
-                new_pooled = new_raw_k.reshape(B, n_new, r, self.head_dim)
-                new_pooled = self.k_layernorm(
-                    new_pooled.astype(mx.float32).mean(axis=2).astype(raw_k.dtype)
-                )
+                if left_padding is not None:
+                    tok_pos = mx.arange(n_cached * r, n_blocks * r)
+                    is_valid = tok_pos[None, :] >= left_padding[:, None]
+                    new_raw_k = mx.where(is_valid[..., None], new_raw_k, 0.0)
+                    valid_counts = mx.maximum(
+                        is_valid.reshape(B, n_new, r).sum(axis=-1, keepdims=True), 1
+                    )
+                    new_pooled = (
+                        new_raw_k.reshape(B, n_new, r, self.head_dim)
+                        .astype(mx.float32)
+                        .sum(axis=2)
+                        / valid_counts
+                    )
+                else:
+                    new_pooled = (
+                        new_raw_k.reshape(B, n_new, r, self.head_dim)
+                        .astype(mx.float32)
+                        .mean(axis=2)
+                    )
+                new_pooled = self.k_layernorm(new_pooled.astype(raw_k.dtype))
                 new_starts = mx.arange(n_cached, n_blocks) * r
                 cos_k, sin_k = rope(new_starts[None, :])
                 new_pooled = _rope_partial(new_pooled, cos_k, sin_k)
@@ -605,12 +637,27 @@ class QSAIndexer(nn.Module):
             else:
                 pooled = cached_pooled
         else:
-            pooled = raw_k[:, : n_blocks * r].reshape(
-                B, n_blocks, r, self.head_dim
-            )
-            pooled = self.k_layernorm(
-                pooled.astype(mx.float32).mean(axis=2).astype(raw_k.dtype)
-            )
+            pooled_raw = raw_k[:, : n_blocks * r]
+            if left_padding is not None:
+                tok_pos = mx.arange(n_blocks * r)
+                is_valid = tok_pos[None, :] >= left_padding[:, None]
+                pooled_raw = mx.where(is_valid[..., None], pooled_raw, 0.0)
+                valid_counts = mx.maximum(
+                    is_valid.reshape(B, n_blocks, r).sum(axis=-1, keepdims=True), 1
+                )
+                pooled = (
+                    pooled_raw.reshape(B, n_blocks, r, self.head_dim)
+                    .astype(mx.float32)
+                    .sum(axis=2)
+                    / valid_counts
+                )
+            else:
+                pooled = (
+                    pooled_raw.reshape(B, n_blocks, r, self.head_dim)
+                    .astype(mx.float32)
+                    .mean(axis=2)
+                )
+            pooled = self.k_layernorm(pooled.astype(raw_k.dtype))
             block_starts = mx.arange(n_blocks) * r
             cos_k, sin_k = rope(block_starts[None, :])
             pooled = _rope_partial(pooled, cos_k, sin_k)
@@ -619,9 +666,6 @@ class QSAIndexer(nn.Module):
         cos_q, sin_q = rope(q_pos[None, :])
         q = self.q_layernorm(q)
         q = _rope_partial(q, cos_q[:, :, None, :], sin_q[:, :, None, :])
-        left_padding = getattr(cache, "left_padding", None)
-        if left_padding is None and hasattr(cache, "indexer"):
-            left_padding = getattr(cache.indexer, "left_padding", None)
         return QSAPrep(
             q=q,
             pooled=pooled,
@@ -646,8 +690,8 @@ class QSAIndexer(nn.Module):
         is_complete = mx.arange(n_blocks)[None, :] < n_complete[:, None]  # (S, n_blocks)
 
         if left_padding is not None:
-            block_ends = (mx.arange(n_blocks) + 1) * r  # (n_blocks,)
-            is_not_pad = block_ends[None, None, :] > left_padding[:, None, None]  # (B, 1, n_blocks)
+            block_starts = mx.arange(n_blocks) * r  # (n_blocks,)
+            is_not_pad = block_starts[None, None, :] >= left_padding[:, None, None]  # (B, 1, n_blocks)
             valid_block = is_complete[None, :, :] & is_not_pad  # (B, S, n_blocks)
         else:
             valid_block = mx.broadcast_to(is_complete[None, :, :], (B, S, n_blocks))
@@ -945,9 +989,17 @@ class GatedDeltaNet(nn.Module):
             mixed_qkv = mx.where(mask[..., None], mixed_qkv, 0)
         conv_input = mx.concatenate([conv_state, mixed_qkv], axis=1)
         if cache is not None:
-            _set_cache_slot(
-                cache, 0, mx.contiguous(conv_input[:, -(self.conv_kernel_size - 1) :, :])
+            new_slot0 = mx.contiguous(
+                conv_input[:, -(self.conv_kernel_size - 1) :, :]
             )
+            if mask is not None:
+                row_active = (
+                    mask.any(axis=-1, keepdims=True)
+                    if mask.ndim > 1
+                    else mask[:, None]
+                )
+                new_slot0 = mx.where(row_active[..., None], new_slot0, conv_state)
+            _set_cache_slot(cache, 0, new_slot0)
         conv_out = nn.silu(self.conv1d(conv_input))
 
         q, k, v = mx.split(conv_out, [self.key_dim, 2 * self.key_dim], axis=-1)
@@ -1099,11 +1151,19 @@ class SparseMoeBlock(nn.Module):
         )
         self.shared_expert = MLP(args.hidden_size, args.shared_expert_intermediate_size)
         self.shared_expert_gate = nn.Linear(args.hidden_size, 1, bias=False)
+        self.norm_topk_prob = getattr(args, "norm_topk_prob", True)
+        self.routed_scaling_factor = float(getattr(args, "routed_scaling_factor", 1.0) or 1.0)
 
     def __call__(self, x: mx.array) -> mx.array:
         logits = self.gate(x.astype(mx.float32))
         idx = mx.argpartition(-logits, self.top_k - 1, axis=-1)[..., : self.top_k]
-        w = mx.softmax(mx.take_along_axis(logits, idx, axis=-1), axis=-1, precise=True)
+        if self.norm_topk_prob:
+            w = mx.softmax(mx.take_along_axis(logits, idx, axis=-1), axis=-1, precise=True)
+        else:
+            scores = mx.softmax(logits, axis=-1, precise=True)
+            w = mx.take_along_axis(scores, idx, axis=-1)
+        if self.routed_scaling_factor != 1.0:
+            w = w * self.routed_scaling_factor
         out = (self.switch_mlp(x, idx) * w[..., None]).sum(axis=-2).astype(x.dtype)
         return out + mx.sigmoid(self.shared_expert_gate(x)) * self.shared_expert(x)
 
@@ -1317,7 +1377,15 @@ class PLELayer(nn.Module):
             x = mx.where(mask[..., None], x, 0)
         full = mx.concatenate([state, x], axis=1)
         if cache is not None:
-            _set_cache_slot(cache, 2, mx.contiguous(full[:, -n:, :]))
+            new_slot2 = mx.contiguous(full[:, -n:, :])
+            if mask is not None:
+                row_active = (
+                    mask.any(axis=-1, keepdims=True)
+                    if mask.ndim > 1
+                    else mask[:, None]
+                )
+                new_slot2 = mx.where(row_active[..., None], new_slot2, state)
+            _set_cache_slot(cache, 2, new_slot2)
         out = nn.silu(self.conv1d(full[:, -(n + S) :, :]))
         if mask is not None:
             out = mx.where(mask[..., None], out, 0)
