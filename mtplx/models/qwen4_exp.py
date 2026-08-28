@@ -116,6 +116,16 @@ class ModelArgs(BaseModelArgs):
     quantization: Any = None
     language_model_only: bool = False
 
+    @classmethod
+    def from_dict(cls, params: dict):
+        tcfg = params.get("text_config")
+        if not tcfg or not isinstance(tcfg, dict):
+            fields = {"model_type", "vision_config", "quantization", "language_model_only"}
+            args = {k: v for k, v in params.items() if k in fields}
+            args["text_config"] = dict(params)
+            return cls(**args)
+        return super().from_dict(params)
+
     def __post_init__(self):
         cfg = dict(self.text_config) if self.text_config else {}
         if not cfg:
@@ -1191,7 +1201,10 @@ class PLELayer(nn.Module):
     def _short_conv(self, x: mx.array, cache: Any) -> mx.array:
         S = x.shape[1]
         n = self.short_conv_state_len
-        has_cache_slots = cache is not None and isinstance(cache, (list, tuple, ArraysCache))
+        has_cache_slots = cache is not None and (
+            isinstance(cache, (list, tuple, ArraysCache))
+            or (hasattr(cache, "__getitem__") and hasattr(cache, "__setitem__"))
+        )
         state = (
             cache[2]
             if (has_cache_slots and cache[2] is not None)
@@ -1330,7 +1343,10 @@ class Qwen4ExpModel(nn.Module):
             eos = self.args.eos_token_id
             eos = eos[0] if isinstance(eos, list) else eos
             pc = cache[self.ple_layers[0]] if len(cache) > self.ple_layers[0] else None
-            has_slots = pc is not None and isinstance(pc, (list, tuple, ArraysCache))
+            has_slots = pc is not None and (
+                isinstance(pc, (list, tuple, ArraysCache))
+                or (hasattr(pc, "__getitem__") and hasattr(pc, "__setitem__"))
+            )
             prev = pc[3] if has_slots else None
             prev_ctx = (
                 prev

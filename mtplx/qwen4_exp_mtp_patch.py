@@ -627,6 +627,9 @@ class Qwen4ExpRecurrentCache:
     def empty(self) -> bool:
         return all(item is None for item in self.cache)
 
+    def __len__(self) -> int:
+        return len(self.cache)
+
     @property
     def meta_state(self) -> tuple[str, str]:
         return ("qwen4_exp_recurrent", str(len(self.cache)))
@@ -654,6 +657,9 @@ def _trim_qsa_indexer(entry: Any, n: int) -> None:
         return
     keep = int(keys.shape[1]) - int(n)
     indexer.keys = keys[:, :keep, :] if keep > 0 else None
+    reuse = getattr(entry, "_sparse_index_reuse", None)
+    if reuse is not None and hasattr(reuse, "reset"):
+        reuse.reset()
 
 
 def _install_indexer_aware_trim(entry: Any) -> Any:
@@ -669,6 +675,10 @@ def _install_indexer_aware_trim(entry: Any) -> Any:
         dropped = int(n if trimmed is None else trimmed)
         if dropped:
             _trim_qsa_indexer(_entry, dropped)
+        else:
+            reuse = getattr(_entry, "_sparse_index_reuse", None)
+            if reuse is not None and hasattr(reuse, "reset"):
+                reuse.reset()
         return trimmed
 
     entry.trim = trim
@@ -1018,7 +1028,10 @@ def _make_mtp_module(args: Any, n_layers: int, qwen4: Any):
                 if attn is None:
                     continue
                 indexer = getattr(attn, "indexer", None)
-                if indexer is None or isinstance(indexer, SparseIndexReuse):
+                if indexer is None:
+                    continue
+                if isinstance(indexer, SparseIndexReuse):
+                    self._sparse_reuse.append(indexer)
                     continue
                 wrapper = SparseIndexReuse(indexer)
                 attn.indexer = wrapper
@@ -1083,6 +1096,11 @@ def inject_qwen4_exp_mtp_support(
 
     text_model = _text_model(model)
     mtp = _make_mtp_module(mtp_args, n_layers, qwen4)
+    if contract is not None:
+        from .mtp_patch import _quantize_mtp_module
+
+        if getattr(contract, "mtp_prequantized", False):
+            _quantize_mtp_module(mtp, contract)
     if weights:
         mtp.load_weights(list(weights.items()), strict=False)
         from mlx.utils import tree_flatten
@@ -1107,6 +1125,10 @@ def inject_qwen4_exp_mtp_support(
             logger.warning(
                 "[Qwen4Exp MTP inject] experts.gate_up_proj did not remap onto switch_mlp.gate_up_proj"
             )
+    if contract is not None and not getattr(contract, "mtp_prequantized", False):
+        from .mtp_patch import _quantize_mtp_module
+
+        _quantize_mtp_module(mtp, contract)
     mtp.install_sparse_reuse()
     mx.eval(mtp.parameters())
 
@@ -1196,10 +1218,12 @@ def inject_qwen4_exp_mtp_support(
             mtp_depth: int | None = None,
             reuse_sparse_indices: bool | None = None,
         ):
-            del mtp_hidden_variant, mtp_depth, concat_order
+            del mtp_hidden_variant, concat_order
             layer_caches = mtp_cache if mtp_cache is not None else self.make_mtp_cache()
             if reuse_sparse_indices is not None:
                 self.mtp.set_sparse_reuse(bool(reuse_sparse_indices))
+            if mtp_depth is None or int(mtp_depth) <= 1:
+                self.mtp.reset_sparse_reuse()
             d = int(self.mtp.hidden_size)
             expected = d * hc
             if int(hidden_states.shape[-1]) != expected:
@@ -1286,16 +1310,22 @@ def inject_qwen4_exp_mtp_support(
             return hidden
 
         def make_mtp_cache(self):
-            return [
-                _install_indexer_aware_trim(_make_attn_cache(qwen4))
-                for _ in self.mtp.layers
-            ]
+            caches = []
+            for layer in self.mtp.layers:
+                entry = _install_indexer_aware_trim(_make_attn_cache(qwen4))
+                attn = getattr(layer, "self_attn", None)
+                indexer = getattr(attn, "indexer", None)
+                if isinstance(indexer, SparseIndexReuse):
+                    entry._sparse_index_reuse = indexer
+                caches.append(entry)
+            return caches
 
         def snapshot_state(self, cache, *, copy: bool = False) -> StateSnapshot:
             return StateSnapshot.capture(cache, copy=copy)
 
         def restore_state(self, cache, snapshot: StateSnapshot) -> None:
             snapshot.restore(cache)
+            self.mtp.reset_sparse_reuse()
 
     text_model.__class__ = _MTPLXQwen4ExpModel
     bind_qwen4_exp_capture_protocol(getattr(text_model, "model", text_model))

@@ -5385,6 +5385,9 @@ def _rollback_mtp_cache(mtp_cache, offset: int) -> None:
         trim = max(0, current - offset)
         if trim and hasattr(cache, "trim"):
             cache.trim(trim)
+        reuse = getattr(cache, "_sparse_index_reuse", None)
+        if reuse is not None and hasattr(reuse, "reset"):
+            reuse.reset()
 
 
 def _add_timing(event: dict, key: str, elapsed_s: float) -> None:

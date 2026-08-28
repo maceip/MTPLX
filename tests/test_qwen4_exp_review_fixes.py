@@ -205,3 +205,158 @@ def test_qwen4_exp_ar_gate_requires_model_shards(tmp_path):
         model_dir=str(trunk_dir),
     )
     assert _passes_qwen4_exp_gate(inspection_trunk) is True
+
+
+def test_sparse_index_reuse_reset_on_rollback_and_cycle_start():
+    from mtplx.generation import _rollback_mtp_cache
+    from mtplx.qwen4_exp_mtp_patch import (
+        SparseIndexReuse,
+        _install_indexer_aware_trim,
+    )
+
+    class DummyIndexer:
+        def __init__(self):
+            self.token_budget = 2048
+            self.n_heads = 4
+            self.head_dim = 128
+
+        def __call__(self, x, rope, cache, offset: int):
+            return mx.zeros((1, 1, 1))
+
+    dummy_indexer = DummyIndexer()
+    wrapper = SparseIndexReuse(dummy_indexer)
+    wrapper.prev_keep = mx.zeros((1, 4, 128))
+
+    attn_cache = _AttnCache()
+    attn_cache.indexer = _IndexerCache()
+    attn_cache.indexer.update(mx.ones((1, 8, 128)))
+    attn_cache._sparse_index_reuse = wrapper
+    _install_indexer_aware_trim(attn_cache)
+
+    assert wrapper.prev_keep is not None
+    # 1. trim() resets prev_keep
+    attn_cache.trim(2)
+    assert wrapper.prev_keep is None
+
+    # 2. _rollback_mtp_cache resets prev_keep
+    wrapper.prev_keep = mx.zeros((1, 4, 128))
+    _rollback_mtp_cache([attn_cache], 0)
+    assert wrapper.prev_keep is None
+
+
+def test_flat_qwen4_exp_config_preserves_geometry():
+    flat_cfg = {
+        "model_type": "qwen4_exp",
+        "hidden_size": 1024,
+        "num_hidden_layers": 16,
+        "num_attention_heads": 8,
+        "num_key_value_heads": 2,
+        "head_dim": 128,
+        "num_experts": 64,
+        "num_experts_per_tok": 4,
+    }
+    args = ModelArgs.from_dict(flat_cfg)
+    assert args.text.hidden_size == 1024
+    assert args.text.num_hidden_layers == 16
+    assert args.text.num_attention_heads == 8
+    assert args.text.num_key_value_heads == 2
+    assert args.text.head_dim == 128
+    assert args.text.num_experts == 64
+    assert args.text.num_experts_per_tok == 4
+
+
+def test_ple_state_preserved_with_recurrent_cache():
+    from mtplx.models.qwen4_exp import PLELayer, TextArgs
+    from mtplx.qwen4_exp_mtp_patch import Qwen4ExpRecurrentCache
+
+    args = TextArgs(
+        hidden_size=256,
+        ple_embed_dim=256,
+        ple_layer_ids=[1],
+        hc_count=2,
+        ngram_size=3,
+        ple_conv_kernel_size=4,
+    )
+    ple = PLELayer(args, ple_layer_index=0)
+    recurrent_cache = Qwen4ExpRecurrentCache(4)
+    assert recurrent_cache[2] is None
+    assert len(recurrent_cache) == 4
+
+    x = mx.ones((1, 1, 256 * 2))
+    out = ple._short_conv(x, recurrent_cache)
+    assert out is not None
+    assert recurrent_cache[2] is not None
+    assert recurrent_cache[2].shape == (1, 9, 256 * 2)
+
+
+def test_mtp_module_quantization_from_contract(tmp_path):
+    from types import SimpleNamespace
+    import mlx.nn as nn
+    from mtplx.models.qwen4_exp import TextArgs
+    from mtplx.mtp_patch import MTPContract
+    from mtplx.qwen4_exp_mtp_patch import inject_qwen4_exp_mtp_support
+
+    config = {
+        "model_type": "qwen4_exp",
+        "hidden_size": 256,
+        "num_hidden_layers": 4,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 2,
+        "head_dim": 64,
+        "mtp_num_hidden_layers": 1,
+        "hc_count": 2,
+        "hc_lowrank": 128,
+    }
+
+    class DummyLanguageModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = SimpleNamespace(
+                layers=[
+                    SimpleNamespace(layer_type="linear_attention"),
+                    SimpleNamespace(layer_type="linear_attention"),
+                    SimpleNamespace(layer_type="linear_attention"),
+                    SimpleNamespace(layer_type="full_attention"),
+                ],
+                embed_tokens=nn.Embedding(100, 256),
+            )
+            self.args = TextArgs(
+                hidden_size=256,
+                num_hidden_layers=4,
+                num_attention_heads=4,
+                num_key_value_heads=2,
+                head_dim=64,
+                hc_count=2,
+                hc_lowrank=128,
+                rope_parameters={},
+                rope_theta=10000.0,
+                partial_rotary_factor=0.25,
+                layer_types=["linear_attention", "linear_attention", "linear_attention", "full_attention"],
+                full_attention_interval=4,
+            )
+
+        def make_cache(self):
+            return [None] * 4
+
+    model = DummyLanguageModel()
+    contract = MTPContract(
+        mtp_quant_bits=4,
+        mtp_quant_group_size=64,
+        mtp_quant_policy="all",
+    )
+
+    success = inject_qwen4_exp_mtp_support(
+        model,
+        str(tmp_path),
+        config,
+        contract=contract,
+        allow_random_init=True,
+    )
+    assert success is True
+    assert hasattr(model, "mtp")
+    # Check that linear layers in MTP are quantized
+    quantized_layers = [
+        m for _, m in model.mtp.named_modules() if isinstance(m, nn.QuantizedLinear)
+    ]
+    assert len(quantized_layers) > 0
+
