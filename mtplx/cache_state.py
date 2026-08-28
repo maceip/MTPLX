@@ -130,19 +130,43 @@ class TailOwnedKVCache:
 
     @property
     def state(self):
+        indexer = getattr(self, "indexer", None)
+        indexer_keys = getattr(indexer, "keys", None) if indexer is not None else None
         if self.keys is None or self.values is None:
-            return self.keys, self.values
-        if self.offset == self.keys.shape[2]:
-            return self.keys, self.values
-        return (
-            self.keys[..., : self.offset, :],
-            self.values[..., : self.offset, :],
-        )
+            base = (self.keys, self.values)
+        elif self.offset == self.keys.shape[2]:
+            base = (self.keys, self.values)
+        else:
+            base = (
+                self.keys[..., : self.offset, :],
+                self.values[..., : self.offset, :],
+            )
+        if indexer is not None:
+            return (*base, indexer_keys)
+        return base
 
     @state.setter
     def state(self, value) -> None:
-        self.keys, self.values = value
-        self.offset = 0 if self.keys is None else int(self.keys.shape[2])
+        if value is None:
+            self.keys = self.values = None
+            self.offset = 0
+            indexer = getattr(self, "indexer", None)
+            if indexer is not None:
+                indexer.keys = None
+                if hasattr(indexer, "_len"):
+                    indexer._len = 0
+            return
+        if len(value) == 3:
+            self.keys, self.values, indexer_keys = value
+            self.offset = 0 if self.keys is None else int(self.keys.shape[2])
+            indexer = getattr(self, "indexer", None)
+            if indexer is not None:
+                indexer.keys = indexer_keys
+                if hasattr(indexer, "_len"):
+                    indexer._len = 0 if indexer_keys is None else int(indexer_keys.shape[1])
+        else:
+            self.keys, self.values = value
+            self.offset = 0 if self.keys is None else int(self.keys.shape[2])
 
     @property
     def meta_state(self) -> tuple[str, ...]:
@@ -408,16 +432,31 @@ class BlockOwnedKVCache(TailOwnedKVCache):
 
     @property
     def state(self):
-        return self._active_arrays()
+        base = self._active_arrays()
+        indexer = getattr(self, "indexer", None)
+        if indexer is not None:
+            return (*base, getattr(indexer, "keys", None))
+        return base
 
     @state.setter
     def state(self, value) -> None:
-        keys, values = value
+        if value is None:
+            keys = values = indexer_keys = None
+        elif len(value) == 3:
+            keys, values, indexer_keys = value
+        else:
+            keys, values = value
+            indexer_keys = None
         self.key_blocks = []
         self.value_blocks = []
         self.offset = 0
         if keys is not None and values is not None:
             self._load_contiguous_state(keys, values, int(keys.shape[2]))
+        indexer = getattr(self, "indexer", None)
+        if indexer is not None:
+            indexer.keys = indexer_keys
+            if hasattr(indexer, "_len"):
+                indexer._len = 0 if indexer_keys is None else int(indexer_keys.shape[1])
 
     @property
     def meta_state(self) -> tuple[str, ...]:
@@ -1918,11 +1957,21 @@ class VllmMetalPagedKVCache:
 
     @property
     def state(self):
-        return self._active_arrays()
+        base = self._active_arrays()
+        indexer = getattr(self, "indexer", None)
+        if indexer is not None:
+            return (*base, getattr(indexer, "keys", None))
+        return base
 
     @state.setter
     def state(self, value) -> None:
-        keys, values = value
+        if value is None:
+            keys = values = indexer_keys = None
+        elif len(value) == 3:
+            keys, values, indexer_keys = value
+        else:
+            keys, values = value
+            indexer_keys = None
         self.key_cache = None
         self.value_cache = None
         self.key_scale_cache = None
@@ -1933,6 +1982,11 @@ class VllmMetalPagedKVCache:
         self._dtypes = None
         if keys is not None and values is not None:
             self._load_contiguous_state(keys, values, int(keys.shape[2]))
+        indexer = getattr(self, "indexer", None)
+        if indexer is not None:
+            indexer.keys = indexer_keys
+            if hasattr(indexer, "_len"):
+                indexer._len = 0 if indexer_keys is None else int(indexer_keys.shape[1])
 
     @property
     def meta_state(self) -> tuple[str, ...]:
@@ -2852,15 +2906,29 @@ class TensorOffsetVllmMetalPagedKVCache:
         flat_v = self._flat_value_cache()
         keys = flat_k.transpose(1, 0, 2)[None, ...]
         values = flat_v.transpose(1, 0, 2)[None, ...]
+        indexer = getattr(self, "indexer", None)
+        if indexer is not None:
+            return keys, values, getattr(indexer, "keys", None)
         return keys, values
 
     @state.setter
     def state(self, value) -> None:
-        keys, values = value
+        if value is None:
+            keys = values = indexer_keys = None
+        elif len(value) == 3:
+            keys, values, indexer_keys = value
+        else:
+            keys, values = value
+            indexer_keys = None
         self.key_cache = None
         self.value_cache = None
         self.offset = 0
         if keys is None or values is None:
+            indexer = getattr(self, "indexer", None)
+            if indexer is not None:
+                indexer.keys = None
+                if hasattr(indexer, "_len"):
+                    indexer._len = 0
             return
         paged = VllmMetalPagedKVCache(
             block_size=int(self.block_size),
@@ -2872,6 +2940,11 @@ class TensorOffsetVllmMetalPagedKVCache:
             paged.value_cache,
             self.offset,
         ]
+        indexer = getattr(self, "indexer", None)
+        if indexer is not None:
+            indexer.keys = indexer_keys
+            if hasattr(indexer, "_len"):
+                indexer._len = 0 if indexer_keys is None else int(indexer_keys.shape[1])
 
     def size(self) -> int:
         import mlx.core as mx

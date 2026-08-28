@@ -2174,6 +2174,12 @@ class ServerState:
         _startup_line(f"[5/6] Model loaded in {self.load_time_s:.1f}s")
         self.backend_descriptor = descriptor_from_runtime(self.runtime, args)
         args.backend_id = self.backend_descriptor.backend_id
+        if not getattr(args, "_explicit_depth", False):
+            set_draft_control_arg(
+                args,
+                self.backend_descriptor,
+                int(self.backend_descriptor.draft_semantics.default),
+            )
         from mtplx.qwen4_exp_mtp_patch import qwen4_exp_product_verify_strategy
 
         qwen4_verify = qwen4_exp_product_verify_strategy(
@@ -13463,17 +13469,21 @@ def _request_depth_for_generation(
         else None
     )
     if value is None:
-        default_value = getattr(
-            state.args,
-            descriptor.draft_semantics.request_field,
-            None,
-        )
-        if default_value is None:
+        explicit_depth = getattr(state.args, "_explicit_depth", False)
+        if explicit_depth:
             default_value = getattr(
                 state.args,
-                "depth",
-                descriptor.draft_semantics.default,
+                descriptor.draft_semantics.request_field,
+                None,
             )
+            if default_value is None:
+                default_value = getattr(
+                    state.args,
+                    "depth",
+                    descriptor.draft_semantics.default,
+                )
+        else:
+            default_value = descriptor.draft_semantics.default
         return descriptor.draft_semantics.clamp(default_value)
     try:
         depth = int(value)
@@ -31800,6 +31810,17 @@ def _apply_backend_server_defaults(
         and backend.reasoning_codec.default_effort
     ):
         args.reasoning_effort = backend.reasoning_codec.default_effort
+    if not _server_flag_present(
+        explicit_flags,
+        "depth",
+        "mtp-depth",
+        "speculative-depth",
+        backend.draft_semantics.request_field,
+    ):
+        args._explicit_depth = False
+        set_draft_control_arg(args, backend, int(backend.draft_semantics.default))
+    else:
+        args._explicit_depth = True
     if backend.backend_id != GEMMA4_BACKEND:
         return
 
@@ -32535,6 +32556,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     args = parser.parse_args(raw_args)
     args._raw_args = list(raw_args)
+    args._explicit_depth = _server_flag_present(
+        _explicit_server_flags(raw_args), "depth", "mtp-depth", "speculative-depth"
+    )
     args._cli_flags = canonicalize_flag_tokens(
         _explicit_server_flags(raw_args), parser, args
     )

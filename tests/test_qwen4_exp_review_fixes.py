@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -621,6 +622,155 @@ def test_short_cache_and_custom_cache_slot_resilience():
     x_ple = mx.ones((1, 1, 256))
     out_ple = ple._short_conv(x_ple, plain_list_cache)
     assert out_ple is not None
+
+
+def test_qsa_indexer_keys_preserved_in_cache_snapshots():
+    from mtplx.cache_state import (
+        BlockOwnedKVCache,
+        TailOwnedKVCache,
+        VllmMetalPagedKVCache,
+        restore_cache,
+        snapshot_cache,
+        snapshot_cache_lazy_hybrid,
+    )
+    from mtplx.models.qwen4_exp import _AttnCache
+
+    # 1. _AttnCache snapshot and restore
+    attn_cache = _AttnCache()
+    attn_cache.indexer.update(mx.ones((1, 8, 128)))
+    attn_cache.keys = mx.zeros((1, 2, 8, 64))
+    attn_cache.values = mx.zeros((1, 2, 8, 64))
+    attn_cache.offset = 8
+
+    snap = snapshot_cache([attn_cache])
+    assert len(snap.states[0]) == 3
+    assert snap.states[0][2] is not None
+    assert snap.states[0][2].shape == (1, 8, 128)
+
+    fresh_attn = _AttnCache()
+    assert fresh_attn.indexer.keys is None
+    restore_cache([fresh_attn], snap)
+    assert fresh_attn.indexer.keys is not None
+    assert fresh_attn.indexer.keys.shape == (1, 8, 128)
+    assert fresh_attn.indexer._len == 8
+
+    # 2. Lazy hybrid snapshot with _AttnCache
+    lazy_snap = snapshot_cache_lazy_hybrid([attn_cache])
+    fresh_lazy = _AttnCache()
+    restore_cache([fresh_lazy], lazy_snap)
+    assert fresh_lazy.indexer.keys is not None
+    assert fresh_lazy.indexer.keys.shape == (1, 8, 128)
+
+    # 3. Paged cache with indexer
+    paged = VllmMetalPagedKVCache.from_cache(attn_cache, block_size=16, num_blocks=4)
+    paged.key_cache = mx.zeros((4, 16, 2, 64))
+    paged.value_cache = mx.zeros((4, 16, 2, 64))
+    paged.offset = 8
+    paged_snap = snapshot_cache([paged])
+    assert len(paged_snap.states[0]) == 3
+    assert paged_snap.states[0][2] is not None
+    assert paged_snap.states[0][2].shape == (1, 8, 128)
+
+    fresh_paged = VllmMetalPagedKVCache.from_cache(attn_cache, block_size=16, num_blocks=4)
+    fresh_paged.indexer.keys = None
+    restore_cache([fresh_paged], paged_snap)
+    assert fresh_paged.indexer.keys is not None
+    assert fresh_paged.indexer.keys.shape == (1, 8, 128)
+
+
+def test_honor_qwen4_exp_declared_d1_default_in_server():
+    from pydantic import BaseModel
+
+    class DummyRequest(BaseModel):
+        pass
+
+    # 1. Unspecified depth: honors Qwen4 descriptor default (D1)
+    args = openai.parse_args(["--model", "Qwen/Qwen3.8-Flash-Next"])
+    assert args._explicit_depth is False
+
+    state = SimpleNamespace(
+        args=args,
+        backend_descriptor=descriptor_for_backend_id("qwen4_exp"),
+        runtime=SimpleNamespace(model=None),
+    )
+    req = DummyRequest()
+    depth = openai._request_depth_for_generation(state, req, generation_mode="mtp")
+    assert depth == 1
+
+    # 2. Explicit --depth 2 on CLI: honors user flag
+    args_explicit = openai.parse_args(["--model", "Qwen/Qwen3.8-Flash-Next", "--depth", "2"])
+    assert args_explicit._explicit_depth is True
+
+    state_explicit = SimpleNamespace(
+        args=args_explicit,
+        backend_descriptor=descriptor_for_backend_id("qwen4_exp"),
+        runtime=SimpleNamespace(model=None),
+    )
+    depth_explicit = openai._request_depth_for_generation(state_explicit, req, generation_mode="mtp")
+    assert depth_explicit == 2
+
+
+def test_raw_hf_qwen4_exp_trunk_norm_gains_converted():
+    from mtplx.models.qwen4_exp import sanitize
+
+    # 1. Raw HF zero-centered Gemma norms (mean around 0.0) -> converted (+1.0)
+    raw_hf_weights = {
+        "model.embed_tokens.weight": mx.zeros((100, 128)),
+        "model.layers.0.self_attn.q_norm.weight": mx.zeros((32,)),
+        "model.layers.0.self_attn.k_norm.weight": mx.zeros((32,)),
+        "model.layers.0.linear_attn.norm.weight": mx.zeros((128,)),
+        "model.layers.0.attn_hyper_connection.hc_norm.weight": mx.zeros((256,)),
+        "model.hyper_connection_mixer.hc_norm.weight": mx.zeros((256,)),
+    }
+    sanitized = sanitize(raw_hf_weights)
+    assert float(sanitized["model.layers.0.self_attn.q_norm.weight"].mean().item()) == 1.0
+    assert float(sanitized["model.layers.0.self_attn.k_norm.weight"].mean().item()) == 1.0
+    assert float(sanitized["model.layers.0.linear_attn.norm.weight"].mean().item()) == 1.0
+    assert float(sanitized["model.layers.0.attn_hyper_connection.hc_norm.weight"].mean().item()) == 1.0
+    assert float(sanitized["model.hyper_connection_mixer.hc_norm.weight"].mean().item()) == 1.0
+
+    # 2. Already converted MLX norms (mean around 1.0) -> not double-shifted
+    mlx_weights = {
+        "model.embed_tokens.weight": mx.zeros((100, 128)),
+        "model.layers.0.self_attn.q_norm.weight": mx.ones((32,)),
+        "model.layers.0.self_attn.k_norm.weight": mx.ones((32,)),
+        "model.layers.0.linear_attn.norm.weight": mx.ones((128,)),
+    }
+    sanitized_mlx = sanitize(mlx_weights)
+    assert float(sanitized_mlx["model.layers.0.self_attn.q_norm.weight"].mean().item()) == 1.0
+    assert float(sanitized_mlx["model.layers.0.linear_attn.norm.weight"].mean().item()) == 1.0
+
+
+def test_rope_scaling_normalized_into_rope_parameters():
+    from mtplx.models.qwen4_exp import Model, ModelArgs, TextArgs
+
+    # 1. Config using rope_scaling dictionary with type="yarn"
+    config = {
+        "model_type": "qwen4_exp",
+        "hidden_size": 128,
+        "num_hidden_layers": 4,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 2,
+        "head_dim": 32,
+        "vocab_size": 50,
+        "rope_scaling": {
+            "type": "yarn",
+            "factor": 4.0,
+            "original_max_position_embeddings": 32768,
+            "beta_fast": 32,
+            "beta_slow": 1,
+        },
+    }
+
+    args = ModelArgs.from_dict(config)
+    assert args.text.rope_parameters is not None
+    assert args.text.rope_parameters.get("rope_type") == "yarn"
+    assert float(args.text.rope_parameters.get("factor")) == 4.0
+
+    model = Model(args)
+    # Model's rotary embedding must have applied Yarn scaling (mscale > 1.0 for factor=4.0)
+    assert model.model.rope.mscale > 1.0
+    assert abs(model.model.rope.mscale - (0.1 * math.log(4.0) + 1.0)) < 1e-4
 
 
 

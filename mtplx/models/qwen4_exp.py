@@ -101,12 +101,36 @@ class TextArgs(BaseModelArgs):
     eos_token_id: Any = 248044
     partial_rotary_factor: float = 0.25
     rope_parameters: dict = field(default_factory=dict)
+    rope_scaling: dict = field(default_factory=dict)
     rope_theta: float = 10_000_000.0
     tie_word_embeddings: bool = False
     max_position_embeddings: int = 262144
     # Multi-Token Prediction (MTP) metadata
     mtp_num_hidden_layers: int = 0
     mtp: dict = field(default_factory=dict)
+
+    @classmethod
+    def from_dict(cls, params: dict):
+        params = dict(params)
+        rope_scaling = params.get("rope_scaling")
+        rope_params = params.get("rope_parameters")
+        if isinstance(rope_scaling, dict) and not rope_params:
+            rp = dict(rope_scaling)
+            if "type" in rp and "rope_type" not in rp:
+                rp["rope_type"] = rp["type"]
+            params["rope_parameters"] = rp
+        elif isinstance(rope_params, dict) and isinstance(rope_scaling, dict):
+            merged = dict(rope_scaling)
+            merged.update(rope_params)
+            if "type" in merged and "rope_type" not in merged:
+                merged["rope_type"] = merged["type"]
+            params["rope_parameters"] = merged
+        elif isinstance(rope_params, dict):
+            rp = dict(rope_params)
+            if "type" in rp and "rope_type" not in rp:
+                rp["rope_type"] = rp["type"]
+            params["rope_parameters"] = rp
+        return super().from_dict(params)
 
 
 @dataclass
@@ -219,12 +243,16 @@ class RotaryEmbedding:
         self.mscale = 1.0
         inv_freq = base ** (-mx.arange(0, dim, 2, dtype=mx.float32) / dim)
         rp = rope_parameters or {}
-        if str(rp.get("rope_type", "default")).lower() == "yarn":
+        rope_type = str(rp.get("rope_type") or rp.get("type", "default")).lower()
+        if rope_type == "yarn":
             # Canonical yarn (mirrors mlx-lm rope_utils.YarnRoPE): blend
             # interpolated and extrapolated periods across a correction range,
             # and scale rotation amplitude by mscale.
             factor = float(rp.get("factor", 1.0))
-            orig = float(rp.get("original_max_position_embeddings", 262144))
+            orig = float(
+                rp.get("original_max_position_embeddings")
+                or rp.get("original_max_position", 262144)
+            )
             beta_fast = float(rp.get("beta_fast", 32))
             beta_slow = float(rp.get("beta_slow", 1))
 
@@ -1509,6 +1537,44 @@ class _AttnCache(KVCache):
         super().__init__()
         self.indexer = _IndexerCache()
 
+    @property
+    def state(self):
+        indexer_keys = getattr(self.indexer, "keys", None)
+        if self.keys is None or self.values is None:
+            return self.keys, self.values, indexer_keys
+        if self.offset == self.keys.shape[2]:
+            return self.keys, self.values, indexer_keys
+        return (
+            self.keys[..., : self.offset, :],
+            self.values[..., : self.offset, :],
+            indexer_keys,
+        )
+
+    @state.setter
+    def state(self, v):
+        if v is None:
+            self.keys = self.values = None
+            self.offset = 0
+            if hasattr(self, "indexer") and self.indexer is not None:
+                self.indexer.keys = None
+                self.indexer._len = 0
+            return
+        if len(v) == 3:
+            keys, values, indexer_keys = v
+            self.keys = keys
+            self.values = values
+            self.offset = 0 if self.keys is None else int(self.keys.shape[2])
+            if hasattr(self, "indexer") and self.indexer is not None:
+                self.indexer.keys = indexer_keys
+                self.indexer._len = (
+                    0 if indexer_keys is None else int(indexer_keys.shape[1])
+                )
+        else:
+            keys, values = v
+            self.keys = keys
+            self.values = values
+            self.offset = 0 if self.keys is None else int(self.keys.shape[2])
+
 
 # ---------------------------------------------------------------------------
 # Top-level Model & Weight sanitization
@@ -1716,6 +1782,43 @@ def remap_fused_projections(weights: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
+_QWEN4_TRUNK_NORM_SUFFIXES = (
+    "hc_norm.weight",
+    "q_norm.weight",
+    "k_norm.weight",
+    "q_layernorm.weight",
+    "k_layernorm.weight",
+    "norm.weight",
+    "norm_key.weight",
+    "norm_query.weight",
+    "norm_conv.weight",
+)
+
+
+def _shift_trunk_gemma_norms(weights: Dict[str, Any]) -> Dict[str, Any]:
+    """Restore MLX-absolute RMSNorm gains on raw HF qwen4_exp trunk weights."""
+    targets = [
+        (k, v)
+        for k, v in weights.items()
+        if not k.startswith("mtp.")
+        and getattr(v, "ndim", None) == 1
+        and any(str(k).endswith(suffix) for suffix in _QWEN4_TRUNK_NORM_SUFFIXES)
+    ]
+    if not targets:
+        return weights
+    try:
+        means = [float(v.mean().item()) for _, v in targets]
+        if sum(means) / len(means) > 0.5:
+            return weights
+    except Exception:
+        return weights
+
+    out = dict(weights)
+    for k, v in targets:
+        out[k] = v + 1.0
+    return out
+
+
 def sanitize(weights: Dict[str, Any]) -> Dict[str, Any]:
     """Sanitize checkpoint weights to match the MTPLX module hierarchy.
 
@@ -1726,6 +1829,7 @@ def sanitize(weights: Dict[str, Any]) -> Dict[str, Any]:
       - Stacks numbered MoE expert tensors into `switch_mlp` if unstacked.
       - Concatenates sharded n-gram embedding tables into ``shard_0`` (post-load;
         on-disk layout is unchanged).
+      - Converts raw zero-centered Gemma trunk norms to MLX absolute convention.
       - Fuses GDN in_proj_qkv+z / in_proj_b+a and MoE gate+up at load time.
       - Retains all `mtp.*` tensors for downstream speculative/MTP lanes.
     """
@@ -1773,6 +1877,7 @@ def sanitize(weights: Dict[str, Any]) -> Dict[str, Any]:
                         )
 
     _concat_sharded_embedding_tables(out)
+    out = _shift_trunk_gemma_norms(out)
     return remap_fused_projections(out)
 
 
