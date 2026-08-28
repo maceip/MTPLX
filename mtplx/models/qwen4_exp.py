@@ -1403,6 +1403,38 @@ class DecoderLayer(nn.Module):
         return hyper + (x[..., None, :] * inject[..., None]).reshape(*x.shape[:-1], -1)
 
 
+def _build_ple_tail_context(
+    prev_ctx: mx.array,
+    ids: mx.array,
+    ctx_len: int,
+    eos: int,
+    left_padding: Optional[Any] = None,
+) -> mx.array:
+    if left_padding is None:
+        return mx.concatenate([prev_ctx, ids], axis=1)[:, -ctx_len:]
+
+    B, S = ids.shape
+    lp_list = (
+        left_padding.tolist()
+        if hasattr(left_padding, "tolist")
+        else list(left_padding)
+    )
+    rows = []
+    for i in range(B):
+        lp = int(lp_list[i]) if i < len(lp_list) else 0
+        v_len = max(0, S - lp)
+        if v_len >= ctx_len:
+            rows.append(ids[i : i + 1, S - ctx_len : S])
+        elif v_len > 0:
+            needed = ctx_len - v_len
+            prefix = prev_ctx[i : i + 1, -needed:]
+            suffix = ids[i : i + 1, lp:S]
+            rows.append(mx.concatenate([prefix, suffix], axis=1))
+        else:
+            rows.append(prev_ctx[i : i + 1])
+    return mx.concatenate(rows, axis=0)
+
+
 class Qwen4ExpModel(nn.Module):
     def __init__(self, args: TextArgs):
         super().__init__()
@@ -1473,6 +1505,20 @@ class Qwen4ExpModel(nn.Module):
             )
         conv_mask = create_ssm_mask(h, linear_cache)
 
+        left_padding = getattr(linear_cache, "left_padding", None)
+        if left_padding is None:
+            for c in cache:
+                if c is not None:
+                    if getattr(c, "left_padding", None) is not None:
+                        left_padding = c.left_padding
+                        break
+                    if (
+                        hasattr(c, "indexer")
+                        and getattr(c.indexer, "left_padding", None) is not None
+                    ):
+                        left_padding = c.indexer.left_padding
+                        break
+
         prev_ctx = None
         if self.ple_layers and ids is not None:
             ctx_len = self.args.ngram_size - 1
@@ -1486,7 +1532,9 @@ class Qwen4ExpModel(nn.Module):
                 else mx.full((ids.shape[0], ctx_len), eos, ids.dtype)
             )
             if pc is not None:
-                tail = mx.concatenate([prev_ctx, ids], axis=1)[:, -ctx_len:]
+                tail = _build_ple_tail_context(
+                    prev_ctx, ids, ctx_len, eos, left_padding
+                )
                 _set_cache_slot(pc, 3, tail)
 
         h = mx.tile(h, (1, 1, self.hc))
@@ -1706,6 +1754,12 @@ class _AttnCache(KVCache):
         super().__init__()
         self.indexer = _IndexerCache()
         self._mtplx_indexer_trim = True
+
+    def update_and_fetch(self, keys: Any, values: Any) -> tuple[Any, Any]:
+        res = super().update_and_fetch(keys, values)
+        if isinstance(res, tuple) and len(res) >= 2:
+            return res[0], res[1]
+        return res
 
     def trim(self, n: int) -> int:
         trimmed = super().trim(n)
@@ -2133,7 +2187,11 @@ class Model(nn.Module):
             self.lm_head = nn.Linear(
                 args.text.hidden_size, args.text.vocab_size, bias=False
             )
-        self.mtp_weights: Dict[str, Any] = {}
+        self._mtp_weights: Dict[str, Any] = {}
+
+    @property
+    def mtp_weights(self) -> Dict[str, Any]:
+        return getattr(self, "_mtp_weights", {})
 
     def __call__(
         self,
@@ -2186,9 +2244,9 @@ class Model(nn.Module):
 
     def sanitize(self, weights: Dict[str, Any]) -> Dict[str, Any]:
         sanitized = sanitize(weights)
-        # Retain MTP tensors accessible via side-channel for MTP lane,
-        # but exclude them from strict trunk loading.
-        self.mtp_weights = {
+        # Retain MTP tensors accessible via private side-channel for MTP lane,
+        # but exclude them from strict trunk loading and module parameter tree.
+        self._mtp_weights = {
             k: v for k, v in sanitized.items() if k.startswith("mtp.")
         }
         return {k: v for k, v in sanitized.items() if not k.startswith("mtp.")}

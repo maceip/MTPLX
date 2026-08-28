@@ -181,6 +181,22 @@ def _candidate_weight_files(model_path: Path, config: dict[str, Any]) -> list[Pa
     return sorted(model_path.glob("model*.safetensors"))
 
 
+def _process_raw_mtp_weights(
+    raw: dict[str, Any], is_mlx_format: bool = False
+) -> dict[str, Any]:
+    mapped: dict[str, Any] = {}
+    for key, value in raw.items():
+        local = _strip_mtp_prefix(key)
+        if local is not None:
+            mapped[local] = value
+        else:
+            mapped[key] = value
+    remapped = _remap_mtp_moe_weights(mapped)
+    if is_mlx_format:
+        return remapped
+    return _shift_qwen4_gemma_mtp_norms(remapped)
+
+
 def _load_mtp_weights(paths: list[Path]) -> dict[str, Any]:
     import mlx.core as mx
 
@@ -1296,12 +1312,25 @@ def inject_qwen4_exp_mtp_support(
         args = TextArgs.from_dict(text_config(config))
     mtp_args = _mtp_text_args(args, config, n_layers)
 
-    weights = _load_mtp_weights(_candidate_weight_files(model_path, config))
+    text_model = _text_model(model)
+    embedded = (
+        getattr(model, "_mtp_weights", None)
+        or getattr(text_model, "_mtp_weights", None)
+        or getattr(model, "mtp_weights", None)
+        or getattr(text_model, "mtp_weights", None)
+    )
+    if embedded:
+        weights = _process_raw_mtp_weights(embedded)
+        if hasattr(model, "_mtp_weights"):
+            model._mtp_weights = {}
+        if hasattr(text_model, "_mtp_weights"):
+            text_model._mtp_weights = {}
+    else:
+        weights = _load_mtp_weights(_candidate_weight_files(model_path, config))
     if not weights and not allow_random_init:
         logger.warning("[Qwen4Exp MTP inject] no mtp.* weights found in %s", model_path)
         return False
 
-    text_model = _text_model(model)
     mtp = _make_mtp_module(mtp_args, n_layers, qwen4)
     if contract is not None:
         from .mtp_patch import _quantize_mtp_module
@@ -1637,10 +1666,13 @@ def _row_to_numpy(row) -> Any:
     return np.asarray(row, dtype=np.float64)
 
 
-def _softmax(row) -> Any:
+def _softmax(row, temperature: float = 1.0) -> Any:
     import numpy as np
 
     x = _row_to_numpy(row)
+    t = float(temperature)
+    if t > 0 and t != 1.0:
+        x = x / t
     x = x - np.max(x)
     e = np.exp(x)
     return e / e.sum()
@@ -1673,7 +1705,7 @@ def sample_logits_row(
     import numpy as np
 
     vocab = int(row.shape[-1])
-    q = _softmax(row)
+    q = _softmax(row, temperature=temperature)
     token = int(rng.choice(np.arange(vocab), p=q))
     return token, q
 
@@ -1693,7 +1725,7 @@ def verify_draft_token(
             return SpeculativeDecision(True, int(draft_token), 1.0)
         return SpeculativeDecision(False, int(target_token), 0.0)
     vocab = int(target_row.shape[-1])
-    target_p = _softmax(target_row)
+    target_p = _softmax(target_row, temperature=temperature)
     return verify_one_token(target_p, draft_q, int(draft_token), rng)
 
 

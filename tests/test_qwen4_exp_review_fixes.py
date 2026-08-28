@@ -1238,6 +1238,128 @@ def test_tensor_offset_paged_cache_update_and_fetch_contract():
     assert v.shape[1] == 2
 
 
+def test_native_attn_cache_update_and_fetch_returns_2tuple():
+    from mtplx.models.qwen4_exp import _AttnCache
+
+    attn_cache = _AttnCache()
+    attn_cache.indexer.update(mx.ones((1, 8, 128)))
+
+    # Initial update_and_fetch
+    k1 = mx.ones((1, 2, 4, 64))
+    v1 = mx.ones((1, 2, 4, 64))
+    res = attn_cache.update_and_fetch(k1, v1)
+    assert isinstance(res, tuple)
+    assert len(res) == 2
+    k, v = res
+    assert k.shape == (1, 2, 4, 64)
+    assert v.shape == (1, 2, 4, 64)
+
+    # State property retains indexer keys (3 elements for snapshotting)
+    assert len(attn_cache.state) == 3
+
+    # Subsequent update_and_fetch
+    k2 = mx.ones((1, 2, 1, 64))
+    v2 = mx.ones((1, 2, 1, 64))
+    k_out, v_out = attn_cache.update_and_fetch(k2, v2)
+    assert k_out.shape == (1, 2, 5, 64)
+    assert v_out.shape == (1, 2, 5, 64)
+
+
+def test_exclude_left_padding_from_ple_tail_context():
+    from mtplx.models.qwen4_exp import _build_ple_tail_context
+
+    ctx_len = 3
+    eos = 151643
+    prev_ctx = mx.full((2, ctx_len), eos, mx.int32)
+    # Row 0 has 3 padding tokens (pad=999) and 1 valid token (42)
+    # Row 1 has 0 padding tokens and 4 valid tokens (10, 20, 30, 40)
+    ids = mx.array([[999, 999, 999, 42], [10, 20, 30, 40]], dtype=mx.int32)
+    left_padding = mx.array([3, 0], dtype=mx.int32)
+
+    tail = _build_ple_tail_context(prev_ctx, ids, ctx_len, eos, left_padding)
+    assert tail.shape == (2, ctx_len)
+
+    # Row 0: valid token is 42, preceding 2 tokens are filled with EOS (151643)
+    row0 = tail[0].tolist()
+    assert row0 == [eos, eos, 42]
+    assert 999 not in row0
+
+    # Row 1: valid tokens are 10, 20, 30, 40 -> last 3 are [20, 30, 40]
+    row1 = tail[1].tolist()
+    assert row1 == [20, 30, 40]
+
+
+def test_embedded_mtp_tensors_outside_module_tree_and_consumed():
+    from mlx.utils import tree_flatten
+    from mtplx.models.qwen4_exp import Model, ModelArgs, TextArgs
+    from mtplx.qwen4_exp_mtp_patch import inject_qwen4_exp_mtp_support
+
+    config = {
+        "model_type": "qwen4_exp",
+        "hidden_size": 128,
+        "num_hidden_layers": 4,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 2,
+        "head_dim": 32,
+        "hc_count": 2,
+        "hc_lowrank": 64,
+        "rope_parameters": {},
+        "layer_types": ["linear_attention", "linear_attention", "linear_attention", "full_attention"],
+        "full_attention_interval": 4,
+        "vocab_size": 50,
+        "mtp_num_hidden_layers": 1,
+    }
+    args = ModelArgs.from_dict(config)
+    model = Model(args)
+
+    # Sanitize weights containing mtp.* keys
+    raw_weights = {
+        "model.embed_tokens.weight": mx.zeros((50, 128)),
+        "mtp.layers.0.linear_attn.in_proj.weight": mx.zeros((256, 128)),
+    }
+    trunk_weights = model.sanitize(raw_weights)
+    assert "mtp.layers.0.linear_attn.in_proj.weight" not in trunk_weights
+
+    # Ensure mtp_weights are NOT registered in nn.Module parameters
+    param_dict = dict(tree_flatten(model.parameters()))
+    assert not any(k.startswith("_mtp_weights") or k.startswith("mtp_weights") for k in param_dict)
+
+    # Side-channel property returns the tensors
+    assert "mtp.layers.0.linear_attn.in_proj.weight" in model.mtp_weights
+
+    # Injection consumes embedded tensors and clears the side-channel
+    injected = inject_qwen4_exp_mtp_support(model, None, config=config, allow_random_init=True)
+    assert injected
+    assert len(model._mtp_weights) == 0
+
+
+def test_temperature_scaling_in_sampling_and_verification():
+    from mtplx.qwen4_exp_mtp_patch import _softmax, sample_logits_row, verify_draft_token
+
+    logits = mx.array([1.0, 2.0, 3.0])
+    p_t1 = _softmax(logits, temperature=1.0)
+    p_cold = _softmax(logits, temperature=0.5)
+    p_hot = _softmax(logits, temperature=2.0)
+
+    # Colder temperature concentrates probability mass on the argmax
+    assert p_cold[2] > p_t1[2]
+    # Hotter temperature flattens distribution
+    assert p_hot[2] < p_t1[2]
+
+    # sample_logits_row applies temperature
+    rng = MagicMock()
+    rng.choice.return_value = 2
+    tok, q = sample_logits_row(logits, temperature=0.5, rng=rng)
+    assert tok == 2
+    assert q[2] == p_cold[2]
+
+    # verify_draft_token applies temperature
+    rng.random.return_value = 0.5
+    decision = verify_draft_token(logits, q, 2, temperature=0.5, rng=rng)
+    assert decision.accepted
+
+
+
 
 
 
