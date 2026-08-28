@@ -1185,7 +1185,7 @@ def _passes_qwen4_exp_gate(inspection: Any) -> bool:
 
 
 def _passes_qwen4_exp_mtp_gate(inspection: Any, tensor_gate: bool) -> bool:
-    """Qwen4-Exp MTP artifact: valid Qwen4-Exp model plus declared MTP markers or tensors."""
+    """Qwen4-Exp MTP artifact: valid Qwen4-Exp model plus declared MTP tensors."""
     if not _passes_qwen4_exp_gate(inspection):
         return False
     keys = _weight_keys(inspection)
@@ -1193,11 +1193,7 @@ def _passes_qwen4_exp_mtp_gate(inspection: Any, tensor_gate: bool) -> bool:
         tensor_gate
         or any(_is_sidecar_mtp_key(k) or "mtp." in k for k in (keys or ()))
     )
-    mtp_layers = int(getattr(inspection, "mtp_num_hidden_layers", 0) or 0)
-    mtp_dict = getattr(inspection, "mtp", None)
-    if mtp_dict is not None and isinstance(mtp_dict, dict):
-        mtp_layers = max(mtp_layers, int(mtp_dict.get("num_hidden_layers", 0) or 0))
-    return bool(has_mtp_tensors or mtp_layers > 0)
+    return bool(has_mtp_tensors)
 
 
 def _passes_mlx_lm_ar_gate(inspection: Any) -> bool:

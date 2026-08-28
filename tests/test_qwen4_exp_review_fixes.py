@@ -360,3 +360,120 @@ def test_mtp_module_quantization_from_contract(tmp_path):
     ]
     assert len(quantized_layers) > 0
 
+
+def test_qsa_gather_attention_applies_array_mask():
+    from mtplx.models.qwen4_exp import QSASelection, _qsa_gather_attention
+
+    B, H, S, D = 1, 2, 2, 64
+    T = 4
+    K = 3
+    q = mx.ones((B, H, S, D))
+    k = mx.ones((B, H, T, D))
+    v = mx.ones((B, H, T, D))
+
+    token_idx = mx.array([[[0, 1, 2], [1, 2, 3]]])  # (1, 2, 3)
+    valid = mx.array([[[True, True, True], [True, True, True]]])
+    sel = QSASelection(token_idx=token_idx, valid=valid)
+
+    # Boolean mask: key 0 and 1 are masked out (False = padding)
+    # mask shape: (B, 1, S, T)
+    mask = mx.array([[[[False, False, True, True], [False, False, True, True]]]])
+    out = _qsa_gather_attention(q, k, v, sel, scale=1.0, mask=mask)
+    assert out.shape == (B, H, S, D)
+
+    # Floating additive mask: key 0 is -1e9
+    mask_float = mx.array([[[[-1e9, 0.0, 0.0, 0.0], [-1e9, 0.0, 0.0, 0.0]]]])
+    out_float = _qsa_gather_attention(q, k, v, sel, scale=1.0, mask=mask_float)
+    assert out_float.shape == (B, H, S, D)
+
+
+def test_qwen4_exp_mtp_gate_requires_mtp_tensors(tmp_path):
+    shard = tmp_path / "model.safetensors"
+    shard.write_bytes(b"dummy")
+
+    # Config declares mtp_num_hidden_layers > 0, but no MTP weights exist and tensor_gate=False
+    inspection_no_mtp_weights = SimpleNamespace(
+        model_type="qwen4_exp",
+        architecture="Qwen4ExpForConditionalGeneration",
+        model_dir=str(tmp_path),
+        mtp_num_hidden_layers=1,
+        weight_keys=("model.embed_tokens.weight", "model.layers.0.mlp.gate_up_proj.weight"),
+    )
+    assert _passes_qwen4_exp_mtp_gate(inspection_no_mtp_weights, tensor_gate=False) is False
+
+    # When tensor_gate=True or MTP weights exist -> passes
+    inspection_with_mtp = SimpleNamespace(
+        model_type="qwen4_exp",
+        architecture="Qwen4ExpForConditionalGeneration",
+        model_dir=str(tmp_path),
+        mtp_num_hidden_layers=1,
+        weight_keys=("mtp.layers.0.self_attn.q_proj.weight",),
+    )
+    assert _passes_qwen4_exp_mtp_gate(inspection_with_mtp, tensor_gate=False) is True
+    assert _passes_qwen4_exp_mtp_gate(inspection_no_mtp_weights, tensor_gate=True) is True
+
+
+def test_mtp_forward_routes_through_installed_draft_head(tmp_path):
+    import mlx.nn as nn
+    from mtplx.models.qwen4_exp import TextArgs
+    from mtplx.qwen4_exp_mtp_patch import inject_qwen4_exp_mtp_support
+
+    config = {
+        "model_type": "qwen4_exp",
+        "hidden_size": 128,
+        "num_hidden_layers": 4,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 2,
+        "head_dim": 32,
+        "mtp_num_hidden_layers": 1,
+        "hc_count": 2,
+        "hc_lowrank": 64,
+    }
+
+    class DummyModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = SimpleNamespace(
+                layers=[
+                    SimpleNamespace(layer_type="linear_attention"),
+                    SimpleNamespace(layer_type="linear_attention"),
+                    SimpleNamespace(layer_type="linear_attention"),
+                    SimpleNamespace(layer_type="full_attention"),
+                ],
+                embed_tokens=nn.Embedding(100, 128),
+            )
+            self.lm_head = nn.Linear(128, 100, bias=False)
+            self.args = TextArgs(
+                hidden_size=128,
+                num_hidden_layers=4,
+                num_attention_heads=4,
+                num_key_value_heads=2,
+                head_dim=32,
+                hc_count=2,
+                hc_lowrank=64,
+                rope_parameters={},
+                rope_theta=10000.0,
+                partial_rotary_factor=0.25,
+                layer_types=["linear_attention", "linear_attention", "linear_attention", "full_attention"],
+                full_attention_interval=4,
+            )
+
+        def make_cache(self):
+            return [None] * 4
+
+    model = DummyModel()
+    inject_qwen4_exp_mtp_support(model, str(tmp_path), config, allow_random_init=True)
+
+    # Attach custom draft head returning a distinct constant
+    class CustomDraftHead(nn.Module):
+        def __call__(self, x):
+            return mx.full((*x.shape[:-1], 100), 42.0)
+
+    model._mtplx_draft_lm_head = CustomDraftHead()
+
+    h = mx.zeros((1, 1, 128 * 2))
+    toks = mx.array([[0]], dtype=mx.int32)
+    logits = model.mtp_forward(h, toks)
+    assert float(logits[0, 0, 0].item()) == 42.0
+
+

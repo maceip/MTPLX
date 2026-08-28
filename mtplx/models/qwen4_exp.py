@@ -412,6 +412,7 @@ def _qsa_gather_attention(
     v: mx.array,
     sel: QSASelection,
     scale: float,
+    mask: Optional[Any] = None,
 ) -> mx.array:
     """SDPA over gathered K=budget tokens per query. q/k/v are [B, H, S, D].
 
@@ -426,6 +427,21 @@ def _qsa_gather_attention(
     safe = mx.clip(mx.where(sel.valid, sel.token_idx, 0), 0, max(T - 1, 0))
     k_sel = _gather_kv_tokens(k, safe)  # (B, H_kv, S, K, D)
     v_sel = _gather_kv_tokens(v, safe)
+
+    mask_gathered = None
+    if isinstance(mask, mx.array):
+        m = mask
+        while m.ndim < 4:
+            m = m[None]
+        if m.shape[0] != B and m.shape[0] == 1:
+            m = mx.broadcast_to(m, (B, m.shape[1], m.shape[2], m.shape[3]))
+        if m.shape[2] != S and m.shape[2] == 1:
+            m = mx.broadcast_to(m, (m.shape[0], m.shape[1], S, m.shape[3]))
+        idx = safe[:, None, :, :]
+        if m.shape[1] > 1:
+            idx = mx.broadcast_to(idx, (B, m.shape[1], S, safe.shape[-1]))
+        mask_gathered = mx.take_along_axis(m, idx, axis=-1)
+
     if H != H_kv:
         rep = H // H_kv
         # Reshape q to (B, H_kv, rep, S, 1, D) and broadcast against (B, H_kv, 1, S, D, K)
@@ -434,6 +450,11 @@ def _qsa_gather_attention(
         k_view = k_sel.swapaxes(-1, -2).reshape(B, H_kv, 1, S, D, -1)
         scores = (mx.matmul(q_view, k_view) * scale).squeeze(-2)  # (B, H_kv, rep, S, K)
         scores = scores.reshape(B, H, S, -1)  # (B, H, S, K)
+        if mask_gathered is not None:
+            if mask_gathered.dtype == mx.bool_:
+                scores = mx.where(mask_gathered, scores, _qsa_neg_inf(q.dtype))
+            else:
+                scores = scores + mask_gathered
         scores = mx.where(sel.valid[:, None, :, :], scores, _qsa_neg_inf(q.dtype))
         probs = mx.softmax(scores.astype(mx.float32), axis=-1).astype(q.dtype)
         probs_view = probs.reshape(B, H_kv, rep, S, 1, -1)  # (B, H_kv, rep, S, 1, K)
@@ -442,6 +463,11 @@ def _qsa_gather_attention(
         return out.reshape(B, H, S, D)
     # (B, H, S, 1, D) @ (B, H, S, D, K) -> (B, H, S, 1, K)
     scores = mx.matmul(q[..., None, :], k_sel.swapaxes(-1, -2)).squeeze(-2) * scale
+    if mask_gathered is not None:
+        if mask_gathered.dtype == mx.bool_:
+            scores = mx.where(mask_gathered, scores, _qsa_neg_inf(q.dtype))
+        else:
+            scores = scores + mask_gathered
     scores = mx.where(sel.valid[:, None, :, :], scores, _qsa_neg_inf(q.dtype))
     probs = mx.softmax(scores.astype(mx.float32), axis=-1).astype(q.dtype)
     # (B, H, S, 1, K) @ (B, H, S, K, D) -> (B, H, S, D)
@@ -663,7 +689,7 @@ class Attention(nn.Module):
             return scaled_dot_product_attention(
                 q, k, v, cache=cache, scale=self.scale, mask=mask
             )
-        return _qsa_gather_attention(q, k, v, sel, self.scale)
+        return _qsa_gather_attention(q, k, v, sel, self.scale, mask=mask)
 
     def __call__(
         self,

@@ -1155,6 +1155,12 @@ def inject_qwen4_exp_mtp_support(
                 return embed.as_linear(h)
             raise RuntimeError("qwen4_exp model has no lm_head / tied embedding")
 
+        def _draft_lm_logits(self, h):
+            draft_head = getattr(self, "_mtplx_draft_lm_head", None)
+            if draft_head is not None:
+                return draft_head(h)
+            return self._lm_logits(h)
+
         def _embed(self, token_ids):
             inner = getattr(self, "model", self)
             return inner.embed_tokens(token_ids)
@@ -1284,7 +1290,7 @@ def inject_qwen4_exp_mtp_support(
                     None,
                 )
             hidden = self.mtp.hyper_connection_mixer(x)
-            logits = self._lm_logits(hidden)
+            logits = self._draft_lm_logits(hidden)
             if not return_hidden:
                 return logits
             return logits, x
