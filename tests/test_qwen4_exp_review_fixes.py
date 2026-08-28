@@ -1004,6 +1004,127 @@ def test_qsa_indexer_cache_batch_protocol():
     assert a_extracted.indexer.keys.shape == (1, 12, 128)
 
 
+def test_avoid_double_filtering_qsa_indexer():
+    from mtplx.models.qwen4_exp import _AttnCache
+    from mtplx.qwen4_exp_mtp_patch import _install_indexer_aware_trim
+
+    a1 = _AttnCache()
+    a1.keys = mx.ones((1, 2, 8, 64))
+    a1.values = mx.ones((1, 2, 8, 64))
+    a1.offset = 8
+    a1.indexer.update(mx.ones((1, 8, 128)))
+
+    a2 = _AttnCache()
+    a2.keys = mx.full((1, 2, 8, 64), 2.0)
+    a2.values = mx.full((1, 2, 8, 64), 2.0)
+    a2.offset = 8
+    a2.indexer.update(mx.full((1, 8, 128), 2.0))
+
+    merged = _AttnCache.merge([a1, a2])
+    assert merged.indexer.batch_size == 2
+
+    # Filtering merged with index [1] must select row 1 and not fail with out-of-bounds
+    merged.filter(mx.array([1]))
+    assert merged.indexer.batch_size == 1
+    assert float(merged.indexer.keys[0, 0, 0].item()) == 2.0
+
+
+def test_mask_ple_updates_for_padded_batch_rows():
+    from mtplx.models.qwen4_exp import PLELayer, TextArgs
+    from mtplx.qwen4_exp_mtp_patch import Qwen4ExpRecurrentCache
+
+    args = TextArgs(
+        hidden_size=64,
+        ple_embed_dim=64,
+        ple_layer_ids=[1],
+        hc_count=2,
+        ngram_size=3,
+        ple_conv_kernel_size=4,
+    )
+    ple = PLELayer(args, ple_layer_index=0)
+    cache = Qwen4ExpRecurrentCache(4)
+
+    # Batch of 2: row 0 is padded (mask=False), row 1 is valid (mask=True)
+    mask = mx.array([[False], [True]])
+    hidden = mx.ones((2, 1, 64 * 2))
+    ids = mx.array([[0], [42]])
+    prev_ctx = mx.zeros((2, 2), dtype=mx.int32)
+
+    out = ple(hidden, ids, prev_ctx, cache, mask=mask)
+    # Row 0 output must be zero because it is masked
+    assert mx.all(out[0] == 0).item()
+    # Row 1 output must be non-zero
+    assert not mx.all(out[1] == 0).item()
+    # Convolution state for row 0 must remain zero
+    assert mx.all(cache[2][0] == 0).item()
+    # Convolution state for row 1 must be updated with valid tokens
+    assert not mx.all(cache[2][1] == 0).item()
+
+
+def test_exclude_padded_blocks_before_qsa_topk_selection():
+    from mtplx.models.qwen4_exp import QSAIndexer, TextArgs
+
+    args = TextArgs(
+        hidden_size=128,
+        num_attention_heads=4,
+        head_dim=32,
+        indexer_n_heads=4,
+        indexer_head_dim=32,
+        indexer_compress_ratio=4,
+        indexer_budget=16,
+        rms_norm_eps=1e-6,
+    )
+    indexer = QSAIndexer(args)
+    indexer.block_topk = 2
+
+    # B=2, S=1.
+    # Total blocks = 6 (24 tokens).
+    # Row 0 has 16 padding tokens (left_padding=16 -> first 4 blocks 0,1,2,3 are padding).
+    # Row 1 has 0 padding tokens (left_padding=0).
+    B, S, H, D = 2, 1, 4, 32
+    n_blocks = 6
+    r = 4
+    kv_len = 24
+    q = mx.ones((B, S, H, D))
+    q_pos = mx.array([kv_len - 1])
+    pooled = mx.ones((B, n_blocks, D))
+
+    left_padding = mx.array([16, 0])
+    sel = indexer.select(q, q_pos, pooled, kv_len, left_padding=left_padding)
+
+    # For row 0, top-k blocks must ONLY be selected from non-padding blocks (index >= 4)
+    row0_toks = sel.token_idx[0, 0].tolist()
+    for idx, valid in zip(row0_toks, sel.valid[0, 0].tolist()):
+        if valid:
+            assert idx >= 16
+
+
+def test_qwen4_tuning_routes_through_batched_verifier(monkeypatch):
+    from mtplx.benchmarks.runners import mtp_depth_sweep
+    from mtplx.commands import public
+    from mtplx.server import openai
+
+    mock_run_sweep = MagicMock(return_value={"ok": True})
+    monkeypatch.setattr(mtp_depth_sweep, "run_mtp_depth_sweep", mock_run_sweep)
+    monkeypatch.setattr(openai, "apply_memory_caps_preflight", lambda **kwargs: {})
+
+    # Call _depth_sweep_native60 with a model named "Qwen/Qwen3.8-Flash-Next"
+    public._depth_sweep_native60(
+        model="Qwen/Qwen3.8-Flash-Next",
+        prompt_suite="dummy",
+        depths="1",
+        max_tokens=10,
+        limit=1,
+        seed=0,
+    )
+
+    assert mock_run_sweep.called
+    kwargs = mock_run_sweep.call_args.kwargs
+    assert kwargs.get("verify_strategy") == "batched"
+    assert kwargs.get("verify_core") == "stock"
+
+
+
 
 
 

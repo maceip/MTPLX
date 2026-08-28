@@ -422,6 +422,7 @@ class QSAPrep:
     pooled: mx.array  # (B, n_blocks, D_idx)
     q_pos: mx.array  # (S,)
     kv_len: int
+    left_padding: Optional[mx.array] = None
 
 
 _QSA_PATH_LOGGED = False
@@ -618,7 +619,16 @@ class QSAIndexer(nn.Module):
         cos_q, sin_q = rope(q_pos[None, :])
         q = self.q_layernorm(q)
         q = _rope_partial(q, cos_q[:, :, None, :], sin_q[:, :, None, :])
-        return QSAPrep(q=q, pooled=pooled, q_pos=q_pos, kv_len=kv_len)
+        left_padding = getattr(cache, "left_padding", None)
+        if left_padding is None and hasattr(cache, "indexer"):
+            left_padding = getattr(cache.indexer, "left_padding", None)
+        return QSAPrep(
+            q=q,
+            pooled=pooled,
+            q_pos=q_pos,
+            kv_len=kv_len,
+            left_padding=left_padding,
+        )
 
     def select(
         self,
@@ -626,6 +636,7 @@ class QSAIndexer(nn.Module):
         q_pos: mx.array,
         pooled: mx.array,
         kv_len: int,
+        left_padding: Optional[mx.array] = None,
     ) -> QSASelection:
         """Score this query slice against every compressed block; return token idx."""
         B, S, _, _ = q.shape
@@ -633,6 +644,13 @@ class QSAIndexer(nn.Module):
         r = self.compress_ratio
         n_complete = (q_pos + 1) // r
         is_complete = mx.arange(n_blocks)[None, :] < n_complete[:, None]  # (S, n_blocks)
+
+        if left_padding is not None:
+            block_ends = (mx.arange(n_blocks) + 1) * r  # (n_blocks,)
+            is_not_pad = block_ends[None, None, :] > left_padding[:, None, None]  # (B, 1, n_blocks)
+            valid_block = is_complete[None, :, :] & is_not_pad  # (B, S, n_blocks)
+        else:
+            valid_block = mx.broadcast_to(is_complete[None, :, :], (B, S, n_blocks))
 
         # Sum_h ReLU(<q_h, k_b>) without materializing the 4-head score tensor.
         acc = None
@@ -642,23 +660,27 @@ class QSAIndexer(nn.Module):
             s_h = mx.maximum(s_h, 0)
             acc = s_h if acc is None else acc + s_h
         scores = acc / math.sqrt(self.head_dim)
-        masked = mx.where(is_complete[None, :, :], scores, -mx.inf)
+        masked = mx.where(valid_block, scores, -mx.inf)
 
         k_blk = min(self.block_topk, n_blocks)
         top = mx.argpartition(-masked, k_blk - 1, axis=-1)[..., :k_blk]
-        is_top_complete = mx.take_along_axis(is_complete[None, :, :], top, axis=-1)
+        is_top_complete = mx.take_along_axis(valid_block, top, axis=-1)
         top = mx.where(is_top_complete, top, 0)
 
         tok = (top[..., None] * r + mx.arange(r)).reshape(B, S, k_blk * r)
         valid_blk = mx.broadcast_to(
             is_top_complete[..., None], (*is_top_complete.shape, r)
         ).reshape(B, S, k_blk * r) & (tok < kv_len)
+        if left_padding is not None:
+            valid_blk = valid_blk & (tok >= left_padding[:, None, None])
 
         tail_start = n_complete * r
         tail = tail_start[:, None] + mx.arange(r)  # (S, r)
         tail_valid = (tail <= q_pos[:, None]) & (tail < kv_len)
         tail = mx.broadcast_to(tail[None], (B, S, r))
         tail_valid = mx.broadcast_to(tail_valid[None], (B, S, r))
+        if left_padding is not None:
+            tail_valid = tail_valid & (tail >= left_padding[:, None, None])
 
         return QSASelection(
             token_idx=mx.concatenate([tok, tail], axis=-1).astype(mx.int32),
@@ -675,7 +697,9 @@ class QSAIndexer(nn.Module):
         n_blocks = int(prep.pooled.shape[1])
         chunk = _indexer_score_chunk(n_blocks, _qsa_query_chunk())
         if S <= chunk:
-            return self.select(prep.q, prep.q_pos, prep.pooled, prep.kv_len)
+            return self.select(
+                prep.q, prep.q_pos, prep.pooled, prep.kv_len, prep.left_padding
+            )
         parts: List[QSASelection] = []
         for s0 in range(0, S, chunk):
             s1 = min(s0 + chunk, S)
@@ -685,6 +709,7 @@ class QSAIndexer(nn.Module):
                     prep.q_pos[s0:s1],
                     prep.pooled,
                     prep.kv_len,
+                    prep.left_padding,
                 )
             )
         return QSASelection(
@@ -844,6 +869,7 @@ class Attention(nn.Module):
                         prep.q_pos[s0:s1],
                         prep.pooled,
                         prep.kv_len,
+                        prep.left_padding,
                     )
                     mask_c = mask
                     if mask_c is not None and not isinstance(mask_c, str):
@@ -1278,7 +1304,7 @@ class PLELayer(nn.Module):
             bias=False,
         )
 
-    def _short_conv(self, x: mx.array, cache: Any) -> mx.array:
+    def _short_conv(self, x: mx.array, cache: Any, mask: Any = None) -> mx.array:
         S = x.shape[1]
         n = self.short_conv_state_len
         slot = _cache_slot(cache, 2)
@@ -1287,13 +1313,23 @@ class PLELayer(nn.Module):
             if slot is not None
             else mx.zeros((x.shape[0], n, x.shape[-1]), dtype=x.dtype)
         )
+        if mask is not None:
+            x = mx.where(mask[..., None], x, 0)
         full = mx.concatenate([state, x], axis=1)
         if cache is not None:
             _set_cache_slot(cache, 2, mx.contiguous(full[:, -n:, :]))
-        return nn.silu(self.conv1d(full[:, -(n + S) :, :]))
+        out = nn.silu(self.conv1d(full[:, -(n + S) :, :]))
+        if mask is not None:
+            out = mx.where(mask[..., None], out, 0)
+        return out
 
     def __call__(
-        self, hidden: mx.array, ids: mx.array, prev_ctx: mx.array, cache: Any
+        self,
+        hidden: mx.array,
+        ids: mx.array,
+        prev_ctx: mx.array,
+        cache: Any,
+        mask: Any = None,
     ) -> mx.array:
         emb = self.ple_embedding(ids, prev_ctx).astype(hidden.dtype)
         key = self.norm_key(self.key_proj(emb))
@@ -1306,7 +1342,12 @@ class PLELayer(nn.Module):
         gate = mx.sqrt(mx.maximum(mx.abs(gate), 1e-6)) * mx.sign(gate)
         gated = mx.sigmoid(gate) * value[..., None, :]
         gated = gated.reshape(*gated.shape[:-2], -1)
-        return gated + self._short_conv(self.norm_conv(gated), cache)
+        if mask is not None:
+            gated = mx.where(mask[..., None], gated, 0)
+        out = gated + self._short_conv(self.norm_conv(gated), cache, mask=mask)
+        if mask is not None:
+            out = mx.where(mask[..., None], out, 0)
+        return out
 
 
 # ---------------------------------------------------------------------------
@@ -1345,7 +1386,7 @@ class DecoderLayer(nn.Module):
     ) -> mx.array:
         del idx_cache  # QSA indexer cache is cache.indexer; house attn is (x, mask, cache)
         if self.ple is not None:
-            h = h + self.ple(h, ids, prev_ctx, cache)
+            h = h + self.ple(h, ids, prev_ctx, cache, conv_mask)
 
         x, hyper, inject = self.attn_hyper_connection(h)
         if self.layer_type == "linear_attention":
@@ -1482,6 +1523,7 @@ class _IndexerCache(_BaseCache):
         self._buf = None
         self._len = 0
         self.pooled = None
+        self.left_padding = None
 
     @property
     def keys(self):
@@ -1535,6 +1577,8 @@ class _IndexerCache(_BaseCache):
     def filter(self, batch_indices: Any) -> None:
         if self._buf is not None:
             self._buf = self._buf[batch_indices]
+        if self.left_padding is not None:
+            self.left_padding = self.left_padding[batch_indices]
         self.pooled = None
 
     def extend(self, other: Any) -> None:
@@ -1576,6 +1620,19 @@ class _IndexerCache(_BaseCache):
         b_pad = pad_right_aligned(other_k, b_batch, L2)
         self._buf = mx.concatenate([a_pad, b_pad], axis=0)
         self._len = max_L
+        other_lp = getattr(other, "left_padding", None)
+        if self.left_padding is not None or other_lp is not None:
+            a_lp = (
+                self.left_padding
+                if self.left_padding is not None
+                else mx.zeros((a_batch,), dtype=mx.int32)
+            )
+            b_lp = (
+                other_lp
+                if other_lp is not None
+                else mx.zeros((b_batch,), dtype=mx.int32)
+            )
+            self.left_padding = mx.concatenate([a_lp, b_lp], axis=0)
         self.pooled = None
 
     def extract(self, idx: int) -> "_IndexerCache":
@@ -1583,6 +1640,8 @@ class _IndexerCache(_BaseCache):
         if self._buf is not None and self._len > 0:
             k = self._buf[idx : idx + 1, : self._len, :]
             cache.keys = mx.contiguous(k)
+        if self.left_padding is not None:
+            cache.left_padding = self.left_padding[idx : idx + 1]
         return cache
 
     @classmethod
@@ -1611,6 +1670,15 @@ class _IndexerCache(_BaseCache):
                 buf[i : i + 1, pad:max_len, :] = k
         cache._buf = buf
         cache._len = max_len
+        lps = [getattr(c, "left_padding", None) for c in caches]
+        if any(lp is not None for lp in lps):
+            lp_list = [
+                lp
+                if lp is not None
+                else mx.zeros((getattr(c, "batch_size", 1),), dtype=mx.int32)
+                for lp, c in zip(lps, caches)
+            ]
+            cache.left_padding = mx.concatenate(lp_list, axis=0)
         cache.pooled = None
         return cache
 
@@ -1637,6 +1705,18 @@ class _AttnCache(KVCache):
     def __init__(self):
         super().__init__()
         self.indexer = _IndexerCache()
+        self._mtplx_indexer_trim = True
+
+    def trim(self, n: int) -> int:
+        trimmed = super().trim(n)
+        dropped = int(n if trimmed is None else trimmed)
+        if hasattr(self, "indexer") and self.indexer is not None:
+            if dropped:
+                self.indexer.trim(dropped)
+        reuse = getattr(self, "_sparse_index_reuse", None)
+        if reuse is not None and hasattr(reuse, "reset"):
+            reuse.reset()
+        return trimmed
 
     def filter(self, batch_indices: Any) -> None:
         if self.keys is not None:
@@ -1687,6 +1767,8 @@ class _AttnCache(KVCache):
         merged = super().merge(caches)
         indexers = [getattr(c, "indexer", None) for c in caches]
         merged.indexer = _IndexerCache.merge(indexers)
+        if getattr(merged, "left_padding", None) is not None:
+            merged.indexer.left_padding = merged.left_padding
         from mtplx.qwen4_exp_mtp_patch import _install_indexer_aware_trim
 
         _install_indexer_aware_trim(merged)

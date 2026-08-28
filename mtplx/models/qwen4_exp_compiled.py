@@ -250,7 +250,7 @@ class CompiledLayerRunner:
             # INTEGRATION POINT (Stage 2): When Lane A/B replaces numpy indexing with
             # purely native MLX ops, ple can be absorbed into the compiled graph.
             if layer.ple is not None:
-                h = h + layer.ple(h, ids, prev_ctx, c)
+                h = h + layer.ple(h, ids, prev_ctx, c, conv_mask)
 
             if runner["type"] == "linear":
                 gdn = runner["gdn"]

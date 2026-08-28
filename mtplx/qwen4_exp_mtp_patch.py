@@ -797,11 +797,16 @@ class Qwen4ExpRecurrentCache:
 
 def _trim_qsa_indexer(entry: Any, n: int) -> None:
     indexer = getattr(entry, "indexer", None)
-    keys = getattr(indexer, "keys", None) if indexer is not None else None
-    if keys is None:
+    if indexer is None:
         return
-    keep = int(keys.shape[1]) - int(n)
-    indexer.keys = keys[:, :keep, :] if keep > 0 else None
+    if hasattr(indexer, "trim") and callable(indexer.trim):
+        indexer.trim(n)
+    else:
+        keys = getattr(indexer, "keys", None)
+        if keys is None:
+            return
+        keep = int(keys.shape[1]) - int(n)
+        indexer.keys = keys[:, :keep, :] if keep > 0 else None
     reuse = getattr(entry, "_sparse_index_reuse", None)
     if reuse is not None and hasattr(reuse, "reset"):
         reuse.reset()
@@ -811,6 +816,10 @@ def _install_indexer_aware_trim(entry: Any) -> Any:
     """KV cache operations must also update the QSA indexer; otherwise batch operations desync them."""
     if entry is None or getattr(entry, "_mtplx_indexer_trim", False):
         return entry
+    if type(entry).__name__ == "_AttnCache":
+        entry._mtplx_indexer_trim = True
+        return entry
+
     orig = getattr(entry, "trim", None)
     if callable(orig):
         def trim(n: int, _orig=orig, _entry=entry):

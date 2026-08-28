@@ -2175,46 +2175,62 @@ def _depth_sweep_native60(
     # Serve-path memory discipline (#261, F7): the depth-sweep harness loads
     # the model in-process; pin the serve-path Metal allocator caps first.
     from mtplx.server.openai import apply_memory_caps_preflight
+    from mtplx.artifacts import inspect_model
+    from mtplx.qwen4_exp_mtp_patch import qwen4_exp_product_verify_env
+
+    try:
+        inspection = inspect_model(model)
+        is_qwen4 = (
+            getattr(inspection, "model_type", None) == "qwen4_exp"
+            or getattr(inspection, "architecture", None)
+            == "Qwen4ExpForConditionalGeneration"
+        )
+    except Exception:
+        is_qwen4 = "qwen4" in str(model).lower() or "qwen3.8" in str(model).lower()
+
+    verify_strategy = "batched" if is_qwen4 else "capture_commit"
+    verify_core = "stock" if is_qwen4 else "linear-gdn-from-conv-tape"
 
     memory_preflight = apply_memory_caps_preflight(
         entry="bench.depth_sweep",
         model=str(model),
     )
     try:
-        result = run_mtp_depth_sweep(
-            model,
-            prompt_suite,
-            depths=depths,
-            temperature=float(temperature),
-            top_p=float(top_p),
-            top_k=int(top_k),
-            max_tokens=max_tokens,
-            seed=seed,
-            limit=limit,
-            enable_thinking=False,
-            compare_ar=compare_ar,
-            ar_only=ar_only,
-            gemma4_draft_block_size=gemma4_draft_block_size,
-            base_hidden_variant=base_hidden_variant,
-            mtp_hidden_variant=mtp_hidden_variant,
-            concat_order=concat_order,
-            mtp_cache_policy=mtp_cache_policy,
-            mtp_history_policy=mtp_history_policy,
-            min_speculative_depth=1,
-            verify_strategy="capture_commit",
-            draft_core=str(draft_core or "stock"),
-            verify_core="linear-gdn-from-conv-tape",
-            draft_lm_head_bits=int(draft_lm_head["bits"]),
-            draft_lm_head_group_size=int(draft_lm_head["group_size"]),
-            draft_lm_head_mode=str(draft_lm_head["mode"]),
-            draft_temperature=(
-                None if draft_sampler is None else float(draft_sampler["temperature"])
-            ),
-            draft_top_p=None
-            if draft_sampler is None
-            else float(draft_sampler["top_p"]),
-            draft_top_k=None if draft_sampler is None else int(draft_sampler["top_k"]),
-        )
+        with qwen4_exp_product_verify_env(None) if is_qwen4 else contextlib.nullcontext():
+            result = run_mtp_depth_sweep(
+                model,
+                prompt_suite,
+                depths=depths,
+                temperature=float(temperature),
+                top_p=float(top_p),
+                top_k=int(top_k),
+                max_tokens=max_tokens,
+                seed=seed,
+                limit=limit,
+                enable_thinking=False,
+                compare_ar=compare_ar,
+                ar_only=ar_only,
+                gemma4_draft_block_size=gemma4_draft_block_size,
+                base_hidden_variant=base_hidden_variant,
+                mtp_hidden_variant=mtp_hidden_variant,
+                concat_order=concat_order,
+                mtp_cache_policy=mtp_cache_policy,
+                mtp_history_policy=mtp_history_policy,
+                min_speculative_depth=1,
+                verify_strategy=verify_strategy,
+                draft_core=str(draft_core or "stock"),
+                verify_core=verify_core,
+                draft_lm_head_bits=int(draft_lm_head["bits"]),
+                draft_lm_head_group_size=int(draft_lm_head["group_size"]),
+                draft_lm_head_mode=str(draft_lm_head["mode"]),
+                draft_temperature=(
+                    None if draft_sampler is None else float(draft_sampler["temperature"])
+                ),
+                draft_top_p=None
+                if draft_sampler is None
+                else float(draft_sampler["top_p"]),
+                draft_top_k=None if draft_sampler is None else int(draft_sampler["top_k"]),
+            )
         if isinstance(result, dict):
             result.setdefault("memory_preflight", memory_preflight)
         return result
