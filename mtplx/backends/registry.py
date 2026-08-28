@@ -1150,6 +1150,25 @@ def _passes_nemotron_h_gate(inspection: Any) -> bool:
     return _has_marker_under_prefixes(keys, last_prefixes, ("final_layernorm.weight",))
 
 
+_RECOGNIZED_MTP_SIDECAR_NAMES = frozenset(
+    {
+        "mtp.safetensors",
+        "model-mtp.safetensors",
+        "model-mtp-head.safetensors",
+        "weights.safetensors",
+    }
+)
+
+
+def _is_mtp_sidecar_file(path: Path) -> bool:
+    name = path.name.lower()
+    if name in _RECOGNIZED_MTP_SIDECAR_NAMES:
+        return True
+    if name.endswith("-mtp.safetensors") or name.endswith("-mtp-head.safetensors"):
+        return True
+    return False
+
+
 def _passes_deepseek_v4_gate(inspection: Any) -> bool:
     """DeepSeek-V4-Flash MLX artifact: model_type deepseek_v4 (or the
     DeepseekV4ForCausalLM architecture).  The mlx-community conversion drops the
@@ -1174,7 +1193,7 @@ def _passes_qwen4_exp_gate(inspection: Any) -> bool:
         return False
     try:
         has_trunk = any(
-            path.name != "mtp.safetensors"
+            not _is_mtp_sidecar_file(path)
             for path in Path(str(model_dir)).glob("*.safetensors")
         )
     except OSError:
@@ -1203,7 +1222,7 @@ def _passes_mlx_lm_ar_gate(inspection: Any) -> bool:
         return False
     try:
         has_trunk = any(
-            path.name != "mtp.safetensors"
+            not _is_mtp_sidecar_file(path)
             for path in Path(str(model_dir)).glob("*.safetensors")
         )
     except OSError:
@@ -1593,7 +1612,7 @@ def compatibility_for_inspection(inspection: Any) -> CompatibilityVerdict:
             # instead of a FileNotFoundError deep in the loader.
             try:
                 trunk_weights_exist = any(
-                    path.name != "mtp.safetensors"
+                    not _is_mtp_sidecar_file(path)
                     for path in Path(model_dir).glob("*.safetensors")
                 )
             except OSError:

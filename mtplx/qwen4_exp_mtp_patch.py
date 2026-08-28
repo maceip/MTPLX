@@ -1279,8 +1279,7 @@ def _make_mtp_module(args: Any, n_layers: int, qwen4: Any):
                 if attn is None:
                     continue
                 attn.rope = self.rope
-            # Indexer is wrapped after load_weights so sidecar
-            # ``self_attn.indexer.*`` tensors bind to the real module.
+                attn.indexer = None
 
         def install_sparse_reuse(self) -> None:
             self._sparse_reuse = []
@@ -1660,12 +1659,17 @@ def inject_qwen4_exp_mtp_support(
                 if is_linear:
                     caches.append(ArraysCache(4))
                 else:
-                    entry = _install_indexer_aware_trim(_make_attn_cache(qwen4))
                     attn = getattr(layer, "self_attn", None)
                     indexer = getattr(attn, "indexer", None)
-                    if isinstance(indexer, SparseIndexReuse):
-                        entry._sparse_index_reuse = indexer
-                    caches.append(entry)
+                    if indexer is not None:
+                        entry = _install_indexer_aware_trim(_make_attn_cache(qwen4))
+                        if isinstance(indexer, SparseIndexReuse):
+                            entry._sparse_index_reuse = indexer
+                        caches.append(entry)
+                    else:
+                        from mlx_lm.models.cache import KVCache
+
+                        caches.append(KVCache())
             return caches
 
         def snapshot_state(self, cache, *, copy: bool = False) -> StateSnapshot:

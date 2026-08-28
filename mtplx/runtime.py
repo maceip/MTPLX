@@ -108,6 +108,7 @@ class MTPLXRuntime:
     diagnostic_counters: dict[str, int] = field(default_factory=dict)
     _forward_ar_supports_emit_logits: bool | None = field(default=None, init=False, repr=False)
     _forward_ar_supports_logits_keep: bool | None = field(default=None, init=False, repr=False)
+    _forward_ar_supports_input_embeddings: bool | None = field(default=None, init=False, repr=False)
 
     def _count(self, key: str, amount: int = 1) -> None:
         self.diagnostic_counters[key] = int(self.diagnostic_counters.get(key, 0)) + int(amount)
@@ -121,10 +122,11 @@ class MTPLXRuntime:
             return int(shape[0])
         return 1
 
-    def _forward_ar_capabilities(self) -> tuple[bool, bool]:
+    def _forward_ar_capabilities(self) -> tuple[bool, bool, bool]:
         if (
             self._forward_ar_supports_emit_logits is None
             or self._forward_ar_supports_logits_keep is None
+            or self._forward_ar_supports_input_embeddings is None
         ):
             try:
                 params = py_inspect.signature(self.model.__call__).parameters
@@ -141,9 +143,13 @@ class MTPLXRuntime:
             self._forward_ar_supports_logits_keep = (
                 "logits_keep" in params or patched_kwargs
             )
+            self._forward_ar_supports_input_embeddings = (
+                "input_embeddings" in params or accepts_kwargs
+            )
         return (
             bool(self._forward_ar_supports_emit_logits),
             bool(self._forward_ar_supports_logits_keep),
+            bool(self._forward_ar_supports_input_embeddings),
         )
 
     def embed_tokens(self, input_ids):
@@ -165,8 +171,11 @@ class MTPLXRuntime:
         self._count("forward_ar_hidden_calls" if return_hidden else "forward_ar_plain_calls")
         if not self.mtp_enabled and return_hidden:
             raise RuntimeError("return_hidden requires an MTP-patched runtime")
-        if input_embeddings is not None and not self.mtp_enabled:
-            raise RuntimeError("vision splice requires the MTP-patched runtime")
+        supports_emit_logits, supports_logits_keep, supports_input_embeddings = (
+            self._forward_ar_capabilities()
+        )
+        if input_embeddings is not None and not supports_input_embeddings:
+            raise RuntimeError("this model does not accept input_embeddings; vision splice is unsupported for it")
         kwargs = {}
         if hidden_variant is not None:
             kwargs["hidden_variant"] = hidden_variant
@@ -174,7 +183,6 @@ class MTPLXRuntime:
             # Vision splice path: the patched text model takes the rows
             # directly; ids still travel for mask construction.
             kwargs["input_embeddings"] = input_embeddings
-        supports_emit_logits, supports_logits_keep = self._forward_ar_capabilities()
         if supports_emit_logits:
             kwargs["emit_logits"] = bool(emit_logits)
         elif not emit_logits:

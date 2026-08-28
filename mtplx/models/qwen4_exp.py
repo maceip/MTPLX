@@ -870,8 +870,10 @@ class Attention(nn.Module):
             k, v = cache.update_and_fetch(k, v)
 
         indexer = self.indexer
+        if indexer is None:
+            out = self._core_attend(q, k, v, mask, cache, None)
         # Decode / MTP reuse wrapper: keep the S==1 __call__ contract.
-        if S == 1 or not hasattr(indexer, "prepare"):
+        elif S == 1 or not hasattr(indexer, "prepare"):
             sel = indexer(x, rope, idx_cache, offset)
             if sel is not None and not isinstance(sel, QSASelection) and hasattr(sel, "ndim"):
                 # Dense keep mask from an older wrapper; convert to additive.

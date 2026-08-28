@@ -1563,6 +1563,136 @@ def test_split_fused_eh_proj_weights():
     assert "fc.weight" not in processed
 
 
+def test_forward_ar_allows_vision_splice_without_mtp():
+    from mtplx.runtime import MTPLXRuntime
+
+    class ModelWithInputEmbeddings:
+        def __call__(self, inputs, cache=None, input_embeddings=None, **kwargs):
+            return mx.zeros((1, 1, 10))
+
+    class ModelWithoutInputEmbeddings:
+        def __call__(self, inputs, cache=None, emit_logits=True, logits_keep=None):
+            return mx.zeros((1, 1, 10))
+
+    # 1. Model supports input_embeddings -> forward_ar succeeds without MTP
+    rt = MTPLXRuntime(
+        model=ModelWithInputEmbeddings(),
+        tokenizer=None,
+        model_path=Path("."),
+        mtp_enabled=False,
+        contract=None,
+    )
+    res = rt.forward_ar(
+        mx.array([[1]]),
+        input_embeddings=mx.ones((1, 1, 32)),
+    )
+    assert res is not None
+
+    # 2. Model does not support input_embeddings -> forward_ar raises RuntimeError
+    rt_no_emb = MTPLXRuntime(
+        model=ModelWithoutInputEmbeddings(),
+        tokenizer=None,
+        model_path=Path("."),
+        mtp_enabled=False,
+        contract=None,
+    )
+    import pytest
+    with pytest.raises(RuntimeError, match="does not accept input_embeddings"):
+        rt_no_emb.forward_ar(
+            mx.array([[1]]),
+            input_embeddings=mx.ones((1, 1, 32)),
+        )
+
+
+def test_mtp_predictor_attention_uses_dense_attention():
+    from mtplx.qwen4_exp_mtp_patch import inject_qwen4_exp_mtp_support
+    from mtplx.models.qwen4_exp import Model, ModelArgs
+    from mlx_lm.models.cache import KVCache
+
+    config = {
+        "model_type": "qwen4_exp",
+        "text_config": {
+            "hidden_size": 128,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "head_dim": 32,
+            "linear_num_key_heads": 4,
+            "linear_num_value_heads": 4,
+            "linear_key_head_dim": 32,
+            "linear_value_head_dim": 32,
+            "linear_conv_kernel_dim": 4,
+            "hc_count": 2,
+            "hc_lowrank": 64,
+            "ple_embed_dim": 128,
+            "ple_layer_ids": [],
+            "vocab_size": 50,
+            "layer_types": ["linear_attention", "full_attention"],
+            "mtp_num_hidden_layers": 1,
+            "mtp_layer_types": ["full_attention"],
+        },
+    }
+    args = ModelArgs.from_dict(config)
+    model = Model(args)
+    injected = inject_qwen4_exp_mtp_support(model, None, config=config, allow_random_init=True)
+    assert injected
+
+    # Verify that predictor's attention layers have indexer disabled (dense attention)
+    assert model.mtp.layers[0].self_attn.indexer is None
+
+    # Verify cache allocated for full attention predictor layer is dense KVCache
+    mtp_cache = model.make_mtp_cache()
+    assert len(mtp_cache) == 1
+    assert isinstance(mtp_cache[0], KVCache)
+
+    # Long context forward through MTP predictor remains dense causal without QSA selection errors
+    hidden = mx.ones((1, 1, 128 * 2))
+    next_tok = mx.array([[5]], dtype=mx.int32)
+    logits, next_h = model.mtp_forward(hidden, next_tok, mtp_cache=mtp_cache, return_hidden=True)
+    assert logits.shape[-1] == 50
+    assert next_h.shape == (1, 1, 128 * 2)
+
+
+def test_exclude_all_mtp_sidecars_from_trunk_check(tmp_path):
+    from mtplx.backends.registry import (
+        _passes_qwen4_exp_gate,
+        _passes_mlx_lm_ar_gate,
+        _is_mtp_sidecar_file,
+    )
+    from types import SimpleNamespace
+
+    # 1. Check helper recognition
+    assert _is_mtp_sidecar_file(Path("mtp.safetensors"))
+    assert _is_mtp_sidecar_file(Path("model-mtp.safetensors"))
+    assert _is_mtp_sidecar_file(Path("model-mtp-head.safetensors"))
+    assert _is_mtp_sidecar_file(Path("weights.safetensors"))
+    assert _is_mtp_sidecar_file(Path("custom-mtp.safetensors"))
+    assert _is_mtp_sidecar_file(Path("custom-mtp-head.safetensors"))
+    assert not _is_mtp_sidecar_file(Path("model.safetensors"))
+    assert not _is_mtp_sidecar_file(Path("model-00001-of-00004.safetensors"))
+
+    # 2. Sidecar-only directory (e.g. model-mtp.safetensors only)
+    sidecar_dir = tmp_path / "sidecar_only"
+    sidecar_dir.mkdir()
+    (sidecar_dir / "model-mtp.safetensors").write_bytes(b"dummy")
+    (sidecar_dir / "model-mtp-head.safetensors").write_bytes(b"dummy")
+
+    inspection = SimpleNamespace(
+        model_type="qwen4_exp",
+        architecture="Qwen4ExpForConditionalGeneration",
+        model_dir=sidecar_dir,
+    )
+
+    assert not _passes_qwen4_exp_gate(inspection)
+    assert not _passes_mlx_lm_ar_gate(inspection)
+
+    # 3. Add genuine trunk shard -> gate passes
+    (sidecar_dir / "model.safetensors").write_bytes(b"dummy")
+    assert _passes_qwen4_exp_gate(inspection)
+    assert _passes_mlx_lm_ar_gate(inspection)
+
+
+
 
 
 
