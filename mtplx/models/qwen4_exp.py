@@ -2345,8 +2345,8 @@ def sanitize(weights: Dict[str, Any]) -> Dict[str, Any]:
     """Sanitize checkpoint weights to match the MTPLX module hierarchy.
 
     Key mappings performed:
-      - Strips `language_model.` prefix from Hugging Face checkpoints.
-      - Discards vision tower weights (`vision_tower.` / `model.visual.`).
+      - Strips `model.language_model.` and `language_model.` prefixes from Hugging Face checkpoints.
+      - Discards vision tower weights (`vision_tower.` / `model.visual.` / `visual.`).
       - Transposes 1D conv weights `(C, 1, K)` -> `(C, K, 1)` for MLX.
       - Stacks numbered MoE expert tensors into `switch_mlp` if unstacked.
       - Concatenates sharded n-gram embedding tables into ``shard_0`` (post-load;
@@ -2357,9 +2357,31 @@ def sanitize(weights: Dict[str, Any]) -> Dict[str, Any]:
     """
     out: Dict[str, Any] = {}
     for k, v in weights.items():
-        if k.startswith("language_model."):
-            k = k[len("language_model.") :]
-        if k.startswith("vision_tower.") or k.startswith("model.visual."):
+        if k.startswith("model.language_model."):
+            suffix = k[len("model.language_model.") :]
+            if (
+                suffix.startswith("model.")
+                or suffix.startswith("lm_head.")
+                or suffix.startswith("mtp.")
+            ):
+                k = suffix
+            else:
+                k = "model." + suffix
+        elif k.startswith("language_model."):
+            suffix = k[len("language_model.") :]
+            if (
+                suffix.startswith("model.")
+                or suffix.startswith("lm_head.")
+                or suffix.startswith("mtp.")
+            ):
+                k = suffix
+            else:
+                k = "model." + suffix
+        if (
+            k.startswith("vision_tower.")
+            or k.startswith("model.visual.")
+            or k.startswith("visual.")
+        ):
             continue
         if "conv1d.weight" in k and v.ndim == 3 and v.shape[-1] != 1:
             if v.shape[1] == 1:

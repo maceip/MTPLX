@@ -57,7 +57,11 @@ def _model_type(config: dict[str, Any]) -> str:
 
 def _mtp_block_config(config: dict[str, Any]) -> dict[str, Any]:
     tcfg = text_config(config)
-    raw = tcfg.get("mtp") if isinstance(tcfg.get("mtp"), dict) else {}
+    raw = {}
+    if isinstance(tcfg, dict) and isinstance(tcfg.get("mtp"), dict):
+        raw = tcfg["mtp"]
+    elif isinstance(config, dict) and isinstance(config.get("mtp"), dict):
+        raw = config["mtp"]
     return dict(raw)
 
 
@@ -68,8 +72,10 @@ def _num_mtp_layers(config: dict[str, Any]) -> int:
         mtp.get("num_hidden_layers")
         or tcfg.get("mtp_num_hidden_layers")
         or tcfg.get("num_nextn_predict_layers")
-        or config.get("mtp_num_hidden_layers")
-        or config.get("num_nextn_predict_layers")
+        or tcfg.get("num_mtp_modules")
+        or (config.get("mtp_num_hidden_layers") if isinstance(config, dict) else 0)
+        or (config.get("num_nextn_predict_layers") if isinstance(config, dict) else 0)
+        or (config.get("num_mtp_modules") if isinstance(config, dict) else 0)
         or 0
     )
 

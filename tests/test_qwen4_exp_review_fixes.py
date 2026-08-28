@@ -2095,6 +2095,61 @@ def test_detect_nested_qwen4_mtp_layer_declarations(tmp_path):
     assert arch_id == "qwen4-exp-mtp"
 
 
+def test_qwen4_exp_mtp_patch_recognizes_outer_and_legacy_mtp_declarations():
+    from mtplx.qwen4_exp_mtp_patch import _num_mtp_layers, is_qwen4_exp_mtp_config
+
+    # 1. Outer mtp declaration
+    cfg_outer = {
+        "model_type": "qwen4_exp",
+        "mtp": {"num_hidden_layers": 1},
+    }
+    assert _num_mtp_layers(cfg_outer) == 1
+    assert is_qwen4_exp_mtp_config(cfg_outer) is True
+
+    # 2. Legacy num_mtp_modules
+    cfg_legacy = {
+        "model_type": "qwen4_exp",
+        "num_mtp_modules": 1,
+    }
+    assert _num_mtp_layers(cfg_legacy) == 1
+    assert is_qwen4_exp_mtp_config(cfg_legacy) is True
+
+    # 3. Nested text_config.num_mtp_modules
+    cfg_nested = {
+        "model_type": "qwen4_exp",
+        "text_config": {"model_type": "qwen4_exp", "num_mtp_modules": 1},
+    }
+    assert _num_mtp_layers(cfg_nested) == 1
+    assert is_qwen4_exp_mtp_config(cfg_nested) is True
+
+
+def test_qwen4_exp_sanitize_remaps_conditional_generation_prefixes():
+    from mtplx.models.qwen4_exp import sanitize
+
+    raw_weights = {
+        "model.language_model.model.embed_tokens.weight": mx.zeros((10, 10)),
+        "model.language_model.model.layers.0.self_attn.q_proj.weight": mx.zeros((10, 10)),
+        "model.language_model.lm_head.weight": mx.zeros((10, 10)),
+        "model.language_model.mtp.fc.weight": mx.zeros((10, 10)),
+        "model.language_model.layers.1.self_attn.q_proj.weight": mx.zeros((10, 10)),
+        "model.visual.patch_embed.weight": mx.zeros((5, 5)),
+        "vision_tower.encoder.weight": mx.zeros((5, 5)),
+        "visual.conv.weight": mx.zeros((5, 5)),
+    }
+
+    sanitized = sanitize(raw_weights)
+    assert "model.embed_tokens.weight" in sanitized
+    assert "model.layers.0.self_attn.q_proj.weight" in sanitized
+    assert "model.layers.1.self_attn.q_proj.weight" in sanitized
+    assert "lm_head.weight" in sanitized
+    assert "mtp.fc.weight" in sanitized
+    assert "model.visual.patch_embed.weight" not in sanitized
+    assert "vision_tower.encoder.weight" not in sanitized
+    assert "visual.conv.weight" not in sanitized
+    assert not any(k.startswith("model.language_model.") for k in sanitized)
+    assert not any(k.startswith("language_model.") for k in sanitized)
+
+
 
 
 
