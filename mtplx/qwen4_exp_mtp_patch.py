@@ -1872,8 +1872,6 @@ def draft_tokens(
     tok = int(token_id)
     h = hidden
     for _ in range(n):
-        if mtp_cache is not None:
-            mtp_snapshots.append(StateSnapshot.capture(mtp_cache, copy=False))
         logits, h = model.mtp_forward(
             h,
             mx.array([[tok]], dtype=mx.int32),
@@ -1882,6 +1880,8 @@ def draft_tokens(
             reuse_sparse_indices=reuse_sparse_indices,
         )
         mx.eval(logits, h)
+        if mtp_cache is not None:
+            mtp_snapshots.append(StateSnapshot.capture(mtp_cache, copy=False))
         tok, q = sample_logits_row(logits[0, -1], temperature=temperature, rng=rng)
         drafts.append(tok)
         qs.append(q)

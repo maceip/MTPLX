@@ -85,6 +85,8 @@ class TailOwnedKVCache:
         )
         if hasattr(entry, "indexer"):
             cache.indexer = getattr(entry, "indexer")
+        if getattr(entry, "left_padding", None) is not None:
+            cache.left_padding = getattr(entry, "left_padding")
         return cache
 
     def _own_tail(self, keys: Any, values: Any) -> tuple[Any, Any]:
@@ -196,6 +198,18 @@ class TailOwnedKVCache:
         return n
 
     def make_mask(self, *args, **kwargs):
+        if getattr(self, "left_padding", None) is not None:
+            from mlx_lm.models.cache import create_causal_mask
+
+            N = args[0] if args else kwargs.pop("N", 1)
+            offset = kwargs.pop("offset", self.offset)
+            kwargs.pop("return_array", None)
+            return create_causal_mask(
+                N,
+                offset=offset,
+                left_padding=self.left_padding,
+                **kwargs,
+            )
         from mlx_lm.models.cache import create_attention_mask
 
         return create_attention_mask(*args, offset=self.offset, **kwargs)
@@ -259,6 +273,8 @@ class BlockOwnedKVCache(TailOwnedKVCache):
         )
         if hasattr(entry, "indexer"):
             cache.indexer = getattr(entry, "indexer")
+        if getattr(entry, "left_padding", None) is not None:
+            cache.left_padding = getattr(entry, "left_padding")
         return cache
 
     def _record_shape(self, keys: Any, values: Any) -> None:
@@ -950,6 +966,8 @@ class VllmMetalPagedKVCache:
         )
         if hasattr(entry, "indexer"):
             paged.indexer = getattr(entry, "indexer")
+        if getattr(entry, "left_padding", None) is not None:
+            paged.left_padding = getattr(entry, "left_padding")
         return paged
 
     @property
@@ -2039,6 +2057,18 @@ class VllmMetalPagedKVCache:
         return n
 
     def make_mask(self, *args, **kwargs):
+        if getattr(self, "left_padding", None) is not None:
+            from mlx_lm.models.cache import create_causal_mask
+
+            N = args[0] if args else kwargs.pop("N", 1)
+            offset = kwargs.pop("offset", self.offset)
+            kwargs.pop("return_array", None)
+            return create_causal_mask(
+                N,
+                offset=offset,
+                left_padding=self.left_padding,
+                **kwargs,
+            )
         from mlx_lm.models.cache import create_attention_mask
 
         return create_attention_mask(*args, offset=self.offset, **kwargs)
@@ -2771,6 +2801,8 @@ class TensorOffsetVllmMetalPagedKVCache:
         )
         if hasattr(entry, "indexer"):
             promoted.indexer = getattr(entry, "indexer")
+        if getattr(entry, "left_padding", None) is not None:
+            promoted.left_padding = getattr(entry, "left_padding")
         return promoted
 
     @property
@@ -2852,6 +2884,17 @@ class TensorOffsetVllmMetalPagedKVCache:
     def make_mask(self, N: int, window_size=None, return_array: bool = False):
         import mlx.core as mx
 
+        if getattr(self, "left_padding", None) is not None:
+            from mlx_lm.models.cache import create_causal_mask
+
+            offset_val = self.cache[2]
+            offset = int(offset_val.item()) if hasattr(offset_val, "item") else int(offset_val)
+            return create_causal_mask(
+                N,
+                offset=offset,
+                left_padding=self.left_padding,
+                window_size=window_size,
+            )
         del return_array
         rinds = mx.arange(self.capacity)
         linds = self.cache[2] + mx.arange(N)
@@ -3024,6 +3067,8 @@ class TensorOffsetVllmMetalPagedKVCache:
         )
         if hasattr(self, "indexer"):
             paged.indexer = getattr(self, "indexer")
+        if getattr(self, "left_padding", None) is not None:
+            paged.left_padding = getattr(self, "left_padding")
         if self.cache[0] is None or self.cache[1] is None:
             return paged
         paged.key_cache = self.cache[0]

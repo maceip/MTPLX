@@ -2011,11 +2011,12 @@ class _AttnCache(KVCache):
             from mlx_lm.models.cache import create_causal_mask
 
             offset = getattr(self, "_idx", getattr(self, "offset", 0))
+            window_size = kwargs.pop("window_size", None)
             return create_causal_mask(
                 N,
                 offset=offset,
                 left_padding=self.left_padding,
-                return_array=return_array,
+                window_size=window_size,
                 **kwargs,
             )
         return super().make_mask(N, return_array=return_array, **kwargs)

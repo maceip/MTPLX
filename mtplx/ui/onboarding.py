@@ -289,9 +289,15 @@ def _scan_for_models(
 
 def _expected_embedded_mtp_keys(config: dict[str, Any]) -> set[str]:
     tcfg = config.get("text_config", config) if isinstance(config, dict) else {}
+    mtp_raw = {}
+    if isinstance(tcfg, dict) and isinstance(tcfg.get("mtp"), dict):
+        mtp_raw = tcfg["mtp"]
+    elif isinstance(config, dict) and isinstance(config.get("mtp"), dict):
+        mtp_raw = config["mtp"]
     n_layers = max(
         int(
-            tcfg.get("mtp_num_hidden_layers")
+            mtp_raw.get("num_hidden_layers")
+            or tcfg.get("mtp_num_hidden_layers")
             or tcfg.get("num_nextn_predict_layers")
             or config.get("num_nextn_predict_layers")
             or 0
@@ -423,7 +429,13 @@ def _classify_scanned_model(model_dir: Path) -> ScannedModel:
         except (TypeError, ValueError):
             return 0
 
+    mtp_raw = {}
+    if isinstance(tcfg, dict) and isinstance(tcfg.get("mtp"), dict):
+        mtp_raw = tcfg["mtp"]
+    elif isinstance(config, dict) and isinstance(config.get("mtp"), dict):
+        mtp_raw = config["mtp"]
     mtp_num_hidden_layers = max(
+        _maybe_int(mtp_raw.get("num_hidden_layers")),
         _maybe_int(tcfg.get("mtp_num_hidden_layers")),
         _maybe_int(tcfg.get("num_nextn_predict_layers")),
         _maybe_int(tcfg.get("num_mtp_modules")),

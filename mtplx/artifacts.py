@@ -129,10 +129,19 @@ def is_mtp_key(key: str) -> bool:
 
 def _num_mtp_layers(config: dict[str, Any]) -> int:
     tcfg = text_config(config)
+    mtp_raw = {}
+    if isinstance(tcfg, dict) and isinstance(tcfg.get("mtp"), dict):
+        mtp_raw = tcfg["mtp"]
+    elif isinstance(config, dict) and isinstance(config.get("mtp"), dict):
+        mtp_raw = config["mtp"]
     return int(
-        tcfg.get("mtp_num_hidden_layers")
+        mtp_raw.get("num_hidden_layers")
+        or tcfg.get("mtp_num_hidden_layers")
         or tcfg.get("num_nextn_predict_layers")
-        or config.get("num_nextn_predict_layers")
+        or tcfg.get("num_mtp_modules")
+        or (config.get("mtp_num_hidden_layers") if isinstance(config, dict) else 0)
+        or (config.get("num_nextn_predict_layers") if isinstance(config, dict) else 0)
+        or (config.get("num_mtp_modules") if isinstance(config, dict) else 0)
         or 0
     )
 
@@ -1024,11 +1033,7 @@ def _inspect_hf_model(repo_id: str) -> ModelInspection:
     mtp_exists = mtp_file in files if files else False
     weight_keys: tuple[str, ...] = ()
     config_declares_mtp = bool(
-        tcfg.get("mtp_num_hidden_layers")
-        or tcfg.get("num_nextn_predict_layers")
-        or tcfg.get("num_mtp_modules")
-        or config.get("num_nextn_predict_layers")
-        or config.get("num_mtp_modules")
+        _num_mtp_layers(config) > 0
         or "mtp" in str(architecture or "").lower()
         or "nextn" in str(architecture or "").lower()
     )
@@ -1068,14 +1073,7 @@ def _inspect_hf_model(repo_id: str) -> ModelInspection:
         config_exists=True,
         architecture=architecture,
         model_type=tcfg.get("model_type") or config.get("model_type"),
-        mtp_num_hidden_layers=int(
-            tcfg.get("mtp_num_hidden_layers")
-            or tcfg.get("num_nextn_predict_layers")
-            or tcfg.get("num_mtp_modules")
-            or config.get("num_nextn_predict_layers")
-            or config.get("num_mtp_modules")
-            or 0
-        ),
+        mtp_num_hidden_layers=_num_mtp_layers(config),
         hidden_size=tcfg.get("hidden_size"),
         num_hidden_layers=tcfg.get("num_hidden_layers"),
         vocab_size=tcfg.get("vocab_size"),
@@ -1231,14 +1229,7 @@ def inspect_model(model_dir: Path | str) -> ModelInspection:
         config_exists=config_exists,
         architecture=architecture,
         model_type=tcfg.get("model_type") or config.get("model_type"),
-        mtp_num_hidden_layers=int(
-            tcfg.get("mtp_num_hidden_layers")
-            or tcfg.get("num_nextn_predict_layers")
-            or tcfg.get("num_mtp_modules")
-            or config.get("num_nextn_predict_layers")
-            or config.get("num_mtp_modules")
-            or 0
-        ),
+        mtp_num_hidden_layers=_num_mtp_layers(config),
         hidden_size=tcfg.get("hidden_size"),
         num_hidden_layers=tcfg.get("num_hidden_layers"),
         vocab_size=tcfg.get("vocab_size"),

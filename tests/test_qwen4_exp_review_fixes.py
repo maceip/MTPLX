@@ -1951,6 +1951,150 @@ def test_speculative_generate_preserves_mtp_history_between_rounds():
     assert all(isinstance(t, int) for t in tokens)
 
 
+def test_server_uses_runtime_selected_draft_default_when_not_explicit():
+    from types import SimpleNamespace
+    from mtplx.backends.descriptors import (
+        QWEN3_NEXT_DESCRIPTOR,
+        QWEN4_EXP_DRAFT_SEMANTICS,
+    )
+    from mtplx.server.openai import _request_depth_for_generation
+
+    # Simulate loaded state where args has depth=1 set by runtime startup
+    args = SimpleNamespace(
+        _explicit_depth=False,
+        depth=1,
+        mtp_depth=1,
+    )
+    state = SimpleNamespace(
+        args=args,
+        backend_descriptor=QWEN3_NEXT_DESCRIPTOR,  # generic descriptor has default=3
+        model_id="local_model_without_name_marker",
+    )
+    req = SimpleNamespace(depth=None, mtp_depth=None, speculative_depth=None)
+    depth = _request_depth_for_generation(
+        state,
+        req,
+        generation_mode="speculative",
+    )
+    assert depth == 1
+
+
+def test_rejection_restores_post_step_mtp_snapshot():
+    from mtplx.models.qwen4_exp import Model, ModelArgs
+    from mtplx.qwen4_exp_mtp_patch import inject_qwen4_exp_mtp_support, draft_tokens
+
+    config = {
+        "model_type": "qwen4_exp",
+        "hidden_size": 64,
+        "num_hidden_layers": 2,
+        "num_attention_heads": 2,
+        "num_key_value_heads": 2,
+        "head_dim": 32,
+        "linear_num_key_heads": 2,
+        "linear_num_value_heads": 2,
+        "linear_key_head_dim": 16,
+        "linear_value_head_dim": 16,
+        "linear_conv_kernel_dim": 4,
+        "layer_types": ["linear_attention", "full_attention"],
+        "vocab_size": 50,
+        "ple_layer_ids": [],
+        "mtp": {
+            "num_hidden_layers": 1,
+            "layer_types": ["full_attention"],
+        },
+    }
+    args = ModelArgs.from_dict(config)
+    model = Model(args)
+    inject_qwen4_exp_mtp_support(model, None, config=config, allow_random_init=True)
+
+    mtp_cache = model.make_mtp_cache()
+    logits, h = model(mx.array([[10]]), return_hidden=True)
+    drafts, qs, h_out, mtp_snaps = draft_tokens(
+        model,
+        h,
+        token_id=10,
+        n=2,
+        mtp_cache=mtp_cache,
+        return_snapshots=True,
+    )
+    assert len(mtp_snaps) == 2
+    # Snapshot 0 should be post-step-0 (contains the token_id 10 KV entry)
+    # Restore snapshot 0
+    mtp_snaps[0].restore(mtp_cache)
+    attn_cache = mtp_cache[0]
+    assert attn_cache.offset == 1
+
+
+def test_kv_promotion_preserves_left_padding_and_make_mask():
+    from mtplx.cache_state import (
+        TailOwnedKVCache,
+        BlockOwnedKVCache,
+        VllmMetalPagedKVCache,
+        TensorOffsetVllmMetalPagedKVCache,
+    )
+
+    class MockEntry:
+        def __init__(self):
+            self.keys = mx.zeros((1, 2, 8, 32))
+            self.values = mx.zeros((1, 2, 8, 32))
+            self.offset = 8
+            self.step = 256
+            self.left_padding = mx.array([3], dtype=mx.int32)
+
+    entry = MockEntry()
+    tail = TailOwnedKVCache.from_cache(entry, mode="eval_only")
+    assert tail.left_padding is not None
+    assert int(tail.left_padding[0].item()) == 3
+    mask = tail.make_mask(1)
+    assert mask is not None
+
+    block = BlockOwnedKVCache.from_cache(entry, mode="eval_only")
+    assert block.left_padding is not None
+    assert int(block.left_padding[0].item()) == 3
+
+    paged = VllmMetalPagedKVCache.from_cache(entry, block_size=16, num_blocks=4)
+    assert paged.left_padding is not None
+    assert int(paged.left_padding[0].item()) == 3
+    paged_mask = paged.make_mask(1)
+    assert paged_mask is not None
+
+    tensor_paged = TensorOffsetVllmMetalPagedKVCache.from_paged_cache(paged)
+    assert tensor_paged.left_padding is not None
+    assert int(tensor_paged.left_padding[0].item()) == 3
+    tensor_mask = tensor_paged.make_mask(1)
+    assert tensor_mask is not None
+
+    demoted = tensor_paged.to_paged_cache()
+    assert demoted.left_padding is not None
+    assert int(demoted.left_padding[0].item()) == 3
+
+
+def test_detect_nested_qwen4_mtp_layer_declarations(tmp_path):
+    import json
+    from mtplx.artifacts import inspect_model
+    from mtplx.backends.registry import _detect_arch_id
+
+    config_data = {
+        "model_type": "qwen4_exp",
+        "architectures": ["Qwen4ExpForConditionalGeneration"],
+        "text_config": {
+            "model_type": "qwen4_exp",
+            "mtp": {
+                "num_hidden_layers": 1,
+            },
+        },
+    }
+    config_file = tmp_path / "config.json"
+    config_file.write_text(json.dumps(config_data))
+    model_weight = tmp_path / "model.safetensors"
+    model_weight.write_bytes(b"dummy")
+
+    inspection = inspect_model(tmp_path)
+    assert inspection.mtp_num_hidden_layers == 1
+    arch_id = _detect_arch_id(inspection)
+    assert arch_id == "qwen4-exp-mtp"
+
+
 
 
 

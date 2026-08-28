@@ -231,7 +231,7 @@ ARCHITECTURE_CATALOG: dict[str, ArchitectureSupport] = {
         runtime_compatibility="native-contract-gated",
         can_run_verified=True,
         aliases=("qwen4_exp", "Qwen4ExpForConditionalGeneration", "qwen4_exp_text"),
-        config_markers=("mtp_num_hidden_layers", "num_nextn_predict_layers"),
+        config_markers=("mtp_num_hidden_layers", "num_nextn_predict_layers", "mtp"),
         family_gate="qwen4-exp-mtp-head-plus-gdn-rollback",
         references=(
             "REFERENCES:mlx_lm/models/qwen4_exp.py",

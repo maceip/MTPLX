@@ -2221,6 +2221,13 @@ class ServerState:
                 self.backend_descriptor,
                 int(loaded_draft_semantics.default),
             )
+        if loaded_draft_semantics is not None:
+            from dataclasses import replace
+
+            self.backend_descriptor = replace(
+                self.backend_descriptor,
+                draft_semantics=loaded_draft_semantics,
+            )
         if self.backend_descriptor.uses_draft_lm_head:
             _startup_line("[5/6] Installing native-MTP draft head")
         else:
@@ -13502,20 +13509,18 @@ def _request_depth_for_generation(
         else None
     )
     if value is None:
-        explicit_depth = getattr(state.args, "_explicit_depth", False)
-        if explicit_depth:
+        default_value = getattr(
+            state.args,
+            descriptor.draft_semantics.request_field,
+            None,
+        )
+        if default_value is None:
             default_value = getattr(
                 state.args,
-                descriptor.draft_semantics.request_field,
+                "depth",
                 None,
             )
-            if default_value is None:
-                default_value = getattr(
-                    state.args,
-                    "depth",
-                    descriptor.draft_semantics.default,
-                )
-        else:
+        if default_value is None:
             default_value = descriptor.draft_semantics.default
         return descriptor.draft_semantics.clamp(default_value)
     try:
