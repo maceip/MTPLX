@@ -85,6 +85,39 @@ EXPECTED_QWEN_MOE_SWITCH_MLP_MTP_TENSOR_COUNT = len(
     EXPECTED_QWEN_MOE_SWITCH_MLP_MTP_KEYS
 )
 
+EXPECTED_QWEN4_EXP_MTP_KEYS = (
+    "mtp.fc_embedding.weight",
+    "mtp.fc_hidden.weight",
+    "mtp.hyper_connection_mixer.hc_norm.weight",
+    "mtp.hyper_connection_mixer.input_mix_weight_down",
+    "mtp.hyper_connection_mixer.input_mix_weight_up",
+    "mtp.layers.0.attn_hyper_connection.block_inject_weight",
+    "mtp.layers.0.attn_hyper_connection.hc_norm.weight",
+    "mtp.layers.0.attn_hyper_connection.input_mix_weight_down",
+    "mtp.layers.0.attn_hyper_connection.input_mix_weight_up",
+    "mtp.layers.0.mlp.gate.weight",
+    "mtp.layers.0.mlp.shared_expert.down_proj.weight",
+    "mtp.layers.0.mlp.shared_expert.gate_proj.weight",
+    "mtp.layers.0.mlp.shared_expert.up_proj.weight",
+    "mtp.layers.0.mlp.shared_expert_gate.weight",
+    "mtp.layers.0.mlp.switch_mlp.down_proj.weight",
+    "mtp.layers.0.mlp.switch_mlp.gate_proj.weight",
+    "mtp.layers.0.mlp.switch_mlp.up_proj.weight",
+    "mtp.layers.0.mlp_hyper_connection.block_inject_weight",
+    "mtp.layers.0.mlp_hyper_connection.hc_norm.weight",
+    "mtp.layers.0.mlp_hyper_connection.input_mix_weight_down",
+    "mtp.layers.0.mlp_hyper_connection.input_mix_weight_up",
+    "mtp.layers.0.self_attn.k_norm.weight",
+    "mtp.layers.0.self_attn.k_proj.weight",
+    "mtp.layers.0.self_attn.o_proj.weight",
+    "mtp.layers.0.self_attn.q_norm.weight",
+    "mtp.layers.0.self_attn.q_proj.weight",
+    "mtp.layers.0.self_attn.v_proj.weight",
+    "mtp.pre_fc_norm_embedding.weight",
+    "mtp.pre_fc_norm_hidden.weight",
+)
+EXPECTED_QWEN4_EXP_MTP_TENSOR_COUNT = len(EXPECTED_QWEN4_EXP_MTP_KEYS)
+
 MTP_QUANTIZED_LINEAR_WEIGHT_KEYS = (
     "mtp.layers.0.mlp.down_proj.weight",
     "mtp.layers.0.mlp.gate_proj.weight",

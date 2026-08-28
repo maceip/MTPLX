@@ -2270,6 +2270,42 @@ def test_is_qwen4_exp_config_recognizes_architecture_aliases():
     assert is_qwen4_exp_config({"architectures": ["LlamaForCausalLM"]}) is False
 
 
+def test_expected_embedded_mtp_keys_for_qwen4_exp():
+    from mtplx.ui.onboarding import _expected_embedded_mtp_keys
+    from mtplx.constants import EXPECTED_QWEN4_EXP_MTP_KEYS
+
+    cfg = {
+        "model_type": "qwen4_exp",
+        "mtp_num_hidden_layers": 1,
+    }
+    keys = _expected_embedded_mtp_keys(cfg)
+    assert "mtp.fc_embedding.weight" in keys
+    assert "mtp.fc_hidden.weight" in keys
+    assert "mtp.layers.0.mlp.switch_mlp.gate_proj.weight" in keys
+    assert "mtp.fc.weight" not in keys
+    assert set(EXPECTED_QWEN4_EXP_MTP_KEYS).issubset(keys)
+
+
+def test_classify_scanned_model_recognizes_top_level_mtp_num_hidden_layers(tmp_path):
+    import json
+    from mtplx.ui.onboarding import _classify_scanned_model
+
+    config_data = {
+        "model_type": "qwen4_exp",
+        "mtp_num_hidden_layers": 1,
+    }
+    config_file = tmp_path / "config.json"
+    config_file.write_text(json.dumps(config_data))
+
+    # Add a dummy sidecar so it detects an MTP artifact
+    mtp_file = tmp_path / "mtp.safetensors"
+    mtp_file.write_bytes(b"dummy")
+
+    scanned = _classify_scanned_model(tmp_path)
+    assert scanned.arch_id == "qwen4-exp-mtp"
+
+
+
 
 
 

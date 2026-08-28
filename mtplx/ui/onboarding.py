@@ -25,6 +25,7 @@ from mtplx.constants import (
     EXPECTED_PREQUANTIZED_MTP_KEYS,
     EXPECTED_QWEN_MOE_MTP_KEYS,
     EXPECTED_QWEN_MOE_PREQUANTIZED_MTP_KEYS,
+    EXPECTED_QWEN4_EXP_MTP_KEYS,
     expand_mtp_layer_keys,
 )
 from mtplx.default_models import (
@@ -287,6 +288,23 @@ def _scan_for_models(
     return results
 
 
+def _is_qwen4_exp_config(config: dict[str, Any]) -> bool:
+    tcfg = config.get("text_config", config) if isinstance(config, dict) else {}
+    model_type = str(tcfg.get("model_type") or config.get("model_type") or "").lower()
+    if model_type in {"qwen4_exp", "qwen4_exp_text"}:
+        return True
+    archs = (
+        (config.get("architectures") if isinstance(config, dict) else None)
+        or tcfg.get("architectures")
+        or []
+    )
+    for arch in archs:
+        compact = str(arch).lower().replace("_", "").replace("-", "")
+        if "qwen4exp" in compact:
+            return True
+    return False
+
+
 def _expected_embedded_mtp_keys(config: dict[str, Any]) -> set[str]:
     tcfg = config.get("text_config", config) if isinstance(config, dict) else {}
     mtp_raw = {}
@@ -299,11 +317,16 @@ def _expected_embedded_mtp_keys(config: dict[str, Any]) -> set[str]:
             mtp_raw.get("num_hidden_layers")
             or tcfg.get("mtp_num_hidden_layers")
             or tcfg.get("num_nextn_predict_layers")
-            or config.get("num_nextn_predict_layers")
+            or tcfg.get("num_mtp_modules")
+            or (config.get("mtp_num_hidden_layers") if isinstance(config, dict) else 0)
+            or (config.get("num_nextn_predict_layers") if isinstance(config, dict) else 0)
+            or (config.get("num_mtp_modules") if isinstance(config, dict) else 0)
             or 0
         ),
         1,
     )
+    if _is_qwen4_exp_config(config):
+        return expand_mtp_layer_keys(EXPECTED_QWEN4_EXP_MTP_KEYS, n_layers)
     if _is_qwen_moe_mtp_config(config):
         mtp_quant = config.get("mtplx_mtp_quantization", {})
         prequantized = isinstance(mtp_quant, dict) and bool(mtp_quant.get("prequantized"))
@@ -452,6 +475,7 @@ def _classify_scanned_model(model_dir: Path) -> ScannedModel:
         _maybe_int(tcfg.get("mtp_num_hidden_layers")),
         _maybe_int(tcfg.get("num_nextn_predict_layers")),
         _maybe_int(tcfg.get("num_mtp_modules")),
+        _maybe_int(config.get("mtp_num_hidden_layers")) if isinstance(config, dict) else 0,
         _maybe_int(config.get("num_nextn_predict_layers")) if isinstance(config, dict) else 0,
         _maybe_int(config.get("num_mtp_modules")) if isinstance(config, dict) else 0,
     )
@@ -474,8 +498,12 @@ def _classify_scanned_model(model_dir: Path) -> ScannedModel:
         model_files = ()
     sidecar_exists = _scan_mtp_sidecar_exists(model_dir, config if isinstance(config, dict) else {})
     embedded_mtp_keys = _scan_embedded_mtp_keys(model_dir)
-    expected_embedded = _expected_embedded_mtp_keys(config if isinstance(config, dict) else {})
-    embedded_gate = bool(embedded_mtp_keys) and set(embedded_mtp_keys) == expected_embedded
+    is_qwen4 = _is_qwen4_exp_config(config if isinstance(config, dict) else {})
+    if is_qwen4:
+        embedded_gate = bool(embedded_mtp_keys)
+    else:
+        expected_embedded = _expected_embedded_mtp_keys(config if isinstance(config, dict) else {})
+        embedded_gate = bool(embedded_mtp_keys) and set(embedded_mtp_keys) == expected_embedded
     mtp_artifact_exists = sidecar_exists or bool(embedded_mtp_keys)
     mtp_tensor_gate = sidecar_exists or embedded_gate
 
