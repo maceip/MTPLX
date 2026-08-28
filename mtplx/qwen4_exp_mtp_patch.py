@@ -1852,22 +1852,28 @@ def draft_tokens(
     temperature: float = 0.0,
     rng: Any | None = None,
     reuse_sparse_indices: bool = True,
-) -> tuple[list[int], list[Any], Any]:
+    mtp_cache: Any | None = None,
+    return_snapshots: bool = False,
+) -> tuple[list[int], list[Any], Any] | tuple[list[int], list[Any], Any, list[StateSnapshot]]:
     """Run the MTP head for up to ``n`` draft tokens. Returns ids, q's, last hidden."""
     import mlx.core as mx
     import numpy as np
 
     rng = rng or np.random.default_rng()
     n = clamp_draft_depth(n)
-    mtp_cache = model.make_mtp_cache()
+    if mtp_cache is None:
+        mtp_cache = model.make_mtp_cache()
     if hasattr(model, "mtp") and hasattr(model.mtp, "reset_sparse_reuse"):
         model.mtp.reset_sparse_reuse()
         model.mtp.set_sparse_reuse(reuse_sparse_indices)
+    mtp_snapshots: list[StateSnapshot] = []
     drafts: list[int] = []
     qs: list[Any] = []
     tok = int(token_id)
     h = hidden
     for _ in range(n):
+        if mtp_cache is not None:
+            mtp_snapshots.append(StateSnapshot.capture(mtp_cache, copy=False))
         logits, h = model.mtp_forward(
             h,
             mx.array([[tok]], dtype=mx.int32),
@@ -1880,6 +1886,8 @@ def draft_tokens(
         drafts.append(tok)
         qs.append(q)
         h = h[:, -1:, :]
+    if return_snapshots:
+        return drafts, qs, h, mtp_snapshots
     return drafts, qs, h
 
 
@@ -1900,8 +1908,17 @@ def speculative_generate(
     rng = rng or np.random.default_rng(0)
     depth = clamp_draft_depth(draft_depth)
     cache = model.make_cache()
+    mtp_cache = model.make_mtp_cache() if hasattr(model, "make_mtp_cache") else None
     logits, hidden = model(prompt_ids, cache=cache, return_hidden=True)
     mx.eval(logits, hidden)
+    if (
+        prompt_ids.shape[1] > 1
+        and mtp_cache is not None
+        and hasattr(model, "mtp_update_cache")
+    ):
+        model.mtp_update_cache(
+            hidden[:, :-1, :], prompt_ids[:, 1:], mtp_cache=mtp_cache
+        )
     primary, _ = sample_logits_row(logits[0, -1], temperature=temperature, rng=rng)
     tokens = [primary]
     hidden = hidden[:, -1:, :]
@@ -1909,7 +1926,7 @@ def speculative_generate(
     while len(tokens) < max_tokens:
         remaining = max_tokens - len(tokens)
         n = min(depth, remaining)
-        drafts, draft_qs, _draft_hidden = draft_tokens(
+        drafts, draft_qs, _draft_hidden, mtp_snaps = draft_tokens(
             model,
             hidden,
             primary,
@@ -1917,6 +1934,8 @@ def speculative_generate(
             temperature=temperature,
             rng=rng,
             reuse_sparse_indices=reuse_sparse_indices,
+            mtp_cache=mtp_cache,
+            return_snapshots=True,
         )
         step_snapshots: list[StateSnapshot] = []
         step_hiddens: list[Any] = []
@@ -1950,6 +1969,8 @@ def speculative_generate(
                 correction = int(decision.token_id)
                 # Instant zero-replay rollback: restore state to position i (after primary + accepted[:i])
                 step_snapshots[i].restore(cache)
+                if mtp_cache is not None and i < len(mtp_snaps):
+                    mtp_snaps[i].restore(mtp_cache)
                 hidden = step_hiddens[i]
                 tokens.extend(accepted)
                 tokens.append(int(correction))

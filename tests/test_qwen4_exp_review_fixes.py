@@ -1665,7 +1665,8 @@ def test_exclude_all_mtp_sidecars_from_trunk_check(tmp_path):
     assert _is_mtp_sidecar_file(Path("mtp.safetensors"))
     assert _is_mtp_sidecar_file(Path("model-mtp.safetensors"))
     assert _is_mtp_sidecar_file(Path("model-mtp-head.safetensors"))
-    assert _is_mtp_sidecar_file(Path("weights.safetensors"))
+    assert _is_mtp_sidecar_file(Path("mtp/weights.safetensors"))
+    assert not _is_mtp_sidecar_file(Path("weights.safetensors"))
     assert _is_mtp_sidecar_file(Path("custom-mtp.safetensors"))
     assert _is_mtp_sidecar_file(Path("custom-mtp-head.safetensors"))
     assert not _is_mtp_sidecar_file(Path("model.safetensors"))
@@ -1885,6 +1886,70 @@ def test_qwen4_server_retains_d1_default_when_not_explicit():
     _apply_backend_server_defaults(args, explicit_flags=explicit_flags)
     assert getattr(args, "_explicit_depth", False) is False
     assert getattr(args, "depth", None) == 1
+
+
+def test_top_level_weights_safetensors_not_classified_as_sidecar(tmp_path):
+    from pathlib import Path
+    from mtplx.backends.registry import _is_mtp_sidecar_file, _passes_mlx_lm_ar_gate, _passes_qwen4_exp_gate
+    from types import SimpleNamespace
+
+    # Top-level weights.safetensors is a legitimate trunk shard
+    top_level_weights = tmp_path / "weights.safetensors"
+    top_level_weights.write_bytes(b"dummy")
+    config_file = tmp_path / "config.json"
+    config_file.write_text('{"model_type": "qwen4_exp"}')
+
+    assert not _is_mtp_sidecar_file(top_level_weights)
+
+    inspection = SimpleNamespace(
+        model_type="qwen4_exp",
+        architecture="Qwen4ExpForConditionalGeneration",
+        model_dir=str(tmp_path),
+    )
+    assert _passes_qwen4_exp_gate(inspection)
+    assert _passes_mlx_lm_ar_gate(inspection)
+
+    # Subdirectory mtp/weights.safetensors is a recognized sidecar
+    mtp_dir = tmp_path / "mtp"
+    mtp_dir.mkdir()
+    mtp_weights = mtp_dir / "weights.safetensors"
+    mtp_weights.write_bytes(b"dummy")
+    assert _is_mtp_sidecar_file(mtp_weights)
+
+
+def test_speculative_generate_preserves_mtp_history_between_rounds():
+    from mtplx.models.qwen4_exp import Model, ModelArgs
+    from mtplx.qwen4_exp_mtp_patch import inject_qwen4_exp_mtp_support, speculative_generate
+
+    config = {
+        "model_type": "qwen4_exp",
+        "hidden_size": 64,
+        "num_hidden_layers": 2,
+        "num_attention_heads": 2,
+        "num_key_value_heads": 2,
+        "head_dim": 32,
+        "linear_num_key_heads": 2,
+        "linear_num_value_heads": 2,
+        "linear_key_head_dim": 16,
+        "linear_value_head_dim": 16,
+        "linear_conv_kernel_dim": 4,
+        "layer_types": ["linear_attention", "full_attention"],
+        "vocab_size": 50,
+        "ple_layer_ids": [],
+        "mtp": {
+            "num_hidden_layers": 1,
+            "layer_types": ["full_attention"],
+        },
+    }
+    args = ModelArgs.from_dict(config)
+    model = Model(args)
+    inject_qwen4_exp_mtp_support(model, None, config=config, allow_random_init=True)
+
+    prompt_ids = mx.array([[1, 2, 3, 4]])
+    tokens = speculative_generate(model, prompt_ids, max_tokens=8, draft_depth=2)
+    assert len(tokens) == 8
+    assert all(isinstance(t, int) for t in tokens)
+
 
 
 

@@ -1155,7 +1155,6 @@ _RECOGNIZED_MTP_SIDECAR_NAMES = frozenset(
         "mtp.safetensors",
         "model-mtp.safetensors",
         "model-mtp-head.safetensors",
-        "weights.safetensors",
     }
 )
 
@@ -1163,6 +1162,8 @@ _RECOGNIZED_MTP_SIDECAR_NAMES = frozenset(
 def _is_mtp_sidecar_file(path: Path) -> bool:
     name = path.name.lower()
     if name in _RECOGNIZED_MTP_SIDECAR_NAMES:
+        return True
+    if name == "weights.safetensors" and path.parent.name.lower() == "mtp":
         return True
     if name.endswith("-mtp.safetensors") or name.endswith("-mtp-head.safetensors"):
         return True
