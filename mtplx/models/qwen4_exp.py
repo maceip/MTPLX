@@ -690,8 +690,8 @@ class QSAIndexer(nn.Module):
         is_complete = mx.arange(n_blocks)[None, :] < n_complete[:, None]  # (S, n_blocks)
 
         if left_padding is not None:
-            block_starts = mx.arange(n_blocks) * r  # (n_blocks,)
-            is_not_pad = block_starts[None, None, :] >= left_padding[:, None, None]  # (B, 1, n_blocks)
+            block_ends = (mx.arange(n_blocks) + 1) * r  # (n_blocks,)
+            is_not_pad = block_ends[None, None, :] > left_padding[:, None, None]  # (B, 1, n_blocks)
             valid_block = is_complete[None, :, :] & is_not_pad  # (B, S, n_blocks)
         else:
             valid_block = mx.broadcast_to(is_complete[None, :, :], (B, S, n_blocks))
@@ -1548,27 +1548,46 @@ def _build_ple_tail_context(
     ctx_len: int,
     eos: int,
     left_padding: Optional[Any] = None,
+    offset: int = 0,
+    mask: Optional[Any] = None,
 ) -> mx.array:
-    if left_padding is None:
+    if left_padding is None and mask is None:
         return mx.concatenate([prev_ctx, ids], axis=1)[:, -ctx_len:]
 
     B, S = ids.shape
+    rows = []
+    if mask is not None:
+        for i in range(B):
+            m_i = mask[i] if mask.ndim > 1 else mask
+            m_list = m_i.tolist() if hasattr(m_i, "tolist") else list(m_i)
+            valid_idx = [idx for idx, v in enumerate(m_list) if v]
+            if len(valid_idx) >= ctx_len:
+                rows.append(ids[i : i + 1, valid_idx[-ctx_len:]])
+            elif len(valid_idx) > 0:
+                needed = ctx_len - len(valid_idx)
+                prefix = prev_ctx[i : i + 1, -needed:]
+                suffix = ids[i : i + 1, valid_idx]
+                rows.append(mx.concatenate([prefix, suffix], axis=1))
+            else:
+                rows.append(prev_ctx[i : i + 1])
+        return mx.concatenate(rows, axis=0)
+
     lp_list = (
         left_padding.tolist()
         if hasattr(left_padding, "tolist")
         else list(left_padding)
     )
-    rows = []
     for i in range(B):
         lp = int(lp_list[i]) if i < len(lp_list) else 0
-        v_len = max(0, S - lp)
+        start_idx = max(0, min(S, lp - int(offset)))
+        valid_ids = ids[i : i + 1, start_idx:S]
+        v_len = int(valid_ids.shape[1])
         if v_len >= ctx_len:
-            rows.append(ids[i : i + 1, S - ctx_len : S])
+            rows.append(valid_ids[:, -ctx_len:])
         elif v_len > 0:
             needed = ctx_len - v_len
             prefix = prev_ctx[i : i + 1, -needed:]
-            suffix = ids[i : i + 1, lp:S]
-            rows.append(mx.concatenate([prefix, suffix], axis=1))
+            rows.append(mx.concatenate([prefix, valid_ids], axis=1))
         else:
             rows.append(prev_ctx[i : i + 1])
     return mx.concatenate(rows, axis=0)
@@ -1671,8 +1690,19 @@ class Qwen4ExpModel(nn.Module):
                 else mx.full((ids.shape[0], ctx_len), eos, ids.dtype)
             )
             if pc is not None:
+                offset = 0
+                if attn_cache is not None and hasattr(attn_cache, "offset"):
+                    offset = int(getattr(attn_cache, "offset", 0))
+                elif linear_cache is not None and hasattr(linear_cache, "offset"):
+                    offset = int(getattr(linear_cache, "offset", 0))
                 tail = _build_ple_tail_context(
-                    prev_ctx, ids, ctx_len, eos, left_padding
+                    prev_ctx,
+                    ids,
+                    ctx_len,
+                    eos,
+                    left_padding=left_padding,
+                    offset=offset,
+                    mask=conv_mask,
                 )
                 _set_cache_slot(pc, 3, tail)
 

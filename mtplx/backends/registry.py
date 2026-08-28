@@ -1192,13 +1192,26 @@ def _passes_qwen4_exp_gate(inspection: Any) -> bool:
     model_dir = getattr(inspection, "model_dir", None)
     if not model_dir:
         return False
-    try:
+    source = getattr(inspection, "source", None)
+    if source == "hf":
+        model_files = getattr(inspection, "model_files", ()) or ()
         has_trunk = any(
-            not _is_mtp_sidecar_file(path)
-            for path in Path(str(model_dir)).glob("*.safetensors")
+            not _is_mtp_sidecar_file(Path(fname))
+            for fname in model_files
         )
-    except OSError:
-        return False
+        if not has_trunk and getattr(inspection, "weight_keys", None):
+            has_trunk = any(
+                not (k.startswith("mtp.") or k.startswith("language_model.mtp."))
+                for k in inspection.weight_keys
+            )
+    else:
+        try:
+            has_trunk = any(
+                not _is_mtp_sidecar_file(path)
+                for path in Path(str(model_dir)).glob("*.safetensors")
+            )
+        except OSError:
+            return False
     if not has_trunk:
         return False
     return _unsupported_quant_bits(model_dir) is None
@@ -1221,13 +1234,26 @@ def _passes_mlx_lm_ar_gate(inspection: Any) -> bool:
     model_dir = getattr(inspection, "model_dir", None)
     if not model_dir:
         return False
-    try:
+    source = getattr(inspection, "source", None)
+    if source == "hf":
+        model_files = getattr(inspection, "model_files", ()) or ()
         has_trunk = any(
-            not _is_mtp_sidecar_file(path)
-            for path in Path(str(model_dir)).glob("*.safetensors")
+            not _is_mtp_sidecar_file(Path(fname))
+            for fname in model_files
         )
-    except OSError:
-        return False
+        if not has_trunk and getattr(inspection, "weight_keys", None):
+            has_trunk = any(
+                not (k.startswith("mtp.") or k.startswith("language_model.mtp."))
+                for k in inspection.weight_keys
+            )
+    else:
+        try:
+            has_trunk = any(
+                not _is_mtp_sidecar_file(path)
+                for path in Path(str(model_dir)).glob("*.safetensors")
+            )
+        except OSError:
+            return False
     if not has_trunk:
         return False
     return _unsupported_quant_bits(model_dir) is None

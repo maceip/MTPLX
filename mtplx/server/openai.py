@@ -3708,7 +3708,12 @@ def _resolve_context_window(tokenizer: Any, model_path: str) -> int:
             if isinstance(rope_scaling, dict):
                 factor = rope_scaling.get("factor")
                 if isinstance(factor, (int, float)) and factor > 1:
-                    orig = section.get("original_max_position_embeddings") or section.get("max_position_embeddings")
+                    orig = (
+                        rope_scaling.get("original_max_position_embeddings")
+                        or rope_scaling.get("original_max_position")
+                        or section.get("original_max_position_embeddings")
+                        or section.get("original_max_position")
+                    )
                     if isinstance(orig, int):
                         candidates.append(int(orig * factor))
 

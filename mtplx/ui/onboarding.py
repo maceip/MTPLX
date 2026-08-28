@@ -348,13 +348,26 @@ def _scan_mtp_sidecar_exists(model_dir: Path, config: dict[str, Any]) -> bool:
     extra = config.get("mlx_lm_extra_tensors", {})
     if isinstance(extra, dict) and extra.get("mtp_file"):
         candidates.append(str(extra["mtp_file"]))
-    candidates.extend(("mtp.safetensors", "mtp/weights.safetensors", "model-mtp.safetensors"))
+    candidates.extend(
+        (
+            "mtp.safetensors",
+            "mtp/weights.safetensors",
+            "model-mtp.safetensors",
+            "model-mtp-head.safetensors",
+        )
+    )
     for rel in candidates:
         try:
             if (model_dir / rel).is_file():
                 return True
         except OSError:
             continue
+    try:
+        for p in model_dir.glob("*.safetensors"):
+            if p.name.endswith("-mtp.safetensors") or p.name.endswith("-mtp-head.safetensors"):
+                return True
+    except OSError:
+        pass
     return False
 
 

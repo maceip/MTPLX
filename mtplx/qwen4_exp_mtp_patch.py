@@ -81,7 +81,19 @@ def _num_mtp_layers(config: dict[str, Any]) -> int:
 
 
 def is_qwen4_exp_config(config: dict[str, Any]) -> bool:
-    return _model_type(config) in QWEN4_EXP_MODEL_TYPES
+    if _model_type(config) in QWEN4_EXP_MODEL_TYPES:
+        return True
+    tcfg = text_config(config)
+    archs = (
+        (config.get("architectures") if isinstance(config, dict) else None)
+        or tcfg.get("architectures")
+        or []
+    )
+    for arch in archs:
+        compact = str(arch).lower().replace("_", "").replace("-", "")
+        if "qwen4exp" in compact:
+            return True
+    return False
 
 
 def is_qwen4_exp_mtp_config(config: dict[str, Any]) -> bool:

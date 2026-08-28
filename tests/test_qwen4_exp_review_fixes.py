@@ -1384,7 +1384,7 @@ def test_moe_routing_policy_norm_topk_and_scaling_factor():
     assert out.shape == (1, 2, 64)
 
 
-def test_qsa_indexer_excludes_partially_padded_blocks():
+def test_qsa_indexer_admits_partially_padded_blocks_with_per_token_mask():
     from mtplx.models.qwen4_exp import QSAIndexer, TextArgs
 
     args = TextArgs(
@@ -1404,11 +1404,11 @@ def test_qsa_indexer_excludes_partially_padded_blocks():
     pooled = mx.ones((1, 3, 32))  # 3 blocks: block 0 (0..3), block 1 (4..7), block 2 (8..11)
 
     sel = indexer.select(q, q_pos, pooled, kv_len=12, left_padding=left_padding)
-    # Block 0 starts at 0 < 3 (padding), so valid_block for block 0 is False.
-    # Selected top-k block should be block 1 (tokens 4..7), NOT block 0.
+    # Block 0 ends at 4 > 3, so it is admitted.
     selected_block_tokens = sel.token_idx[0, 0, :4].tolist()
-    assert selected_block_tokens == [4, 5, 6, 7]
-    assert sel.valid[0, 0, :4].tolist() == [True, True, True, True]
+    assert selected_block_tokens == [0, 1, 2, 3]
+    # Tokens 0, 1, 2 are pad tokens (< 3), token 3 is valid (>= 3)
+    assert sel.valid[0, 0, :4].tolist() == [False, False, False, True]
 
 
 def test_preserve_conv_state_across_masked_timesteps():
@@ -2148,6 +2148,126 @@ def test_qwen4_exp_sanitize_remaps_conditional_generation_prefixes():
     assert "visual.conv.weight" not in sanitized
     assert not any(k.startswith("model.language_model.") for k in sanitized)
     assert not any(k.startswith("language_model.") for k in sanitized)
+
+
+def test_qsa_indexer_select_admits_partially_padded_blocks_with_correct_mask():
+    from mtplx.models.qwen4_exp import QSAIndexer, TextArgs
+
+    args = TextArgs(
+        hidden_size=32,
+        indexer_head_dim=16,
+        indexer_n_heads=2,
+        indexer_compress_ratio=4,
+        indexer_budget=8,
+    )
+    indexer = QSAIndexer(args)
+    indexer.block_topk = 2
+    # 2 blocks of 4 tokens = 8 tokens. left_padding = 5 (tokens 0..4 are pad, 5..7 are real)
+    pooled = mx.ones((1, 2, 16))
+    q = mx.ones((1, 1, 2, 16))
+    q_pos = mx.array([7])
+    left_padding = mx.array([5])
+
+    sel = indexer.select(
+        q=q,
+        q_pos=q_pos,
+        pooled=pooled,
+        kv_len=8,
+        left_padding=left_padding,
+    )
+    # Block 1 should be selected since its end (8) > left_padding (5)
+    # In token_idx: token 4 must be masked as invalid, while tokens 5, 6, 7 are valid
+    tok_list = sel.token_idx.flatten().tolist()
+    val_list = sel.valid.flatten().tolist()
+    valid_tokens = [tok for tok, v in zip(tok_list, val_list) if v]
+    assert len(valid_tokens) > 0
+    assert all(t >= 5 for t in valid_tokens)
+
+
+def test_ple_tail_context_updates_during_decode_steps():
+    from mtplx.models.qwen4_exp import _build_ple_tail_context
+
+    ctx_len = 3
+    eos = 0
+    # Initial prefill with prompt of length 6, left_padding = 2
+    prompt_ids = mx.array([[eos, eos, 10, 11, 12, 13]])
+    left_padding = mx.array([2])
+    prev_ctx = mx.array([[eos, eos, eos]])
+
+    tail_prefill = _build_ple_tail_context(
+        prev_ctx,
+        prompt_ids,
+        ctx_len=ctx_len,
+        eos=eos,
+        left_padding=left_padding,
+        offset=0,
+    )
+    # Valid tokens are [10, 11, 12, 13], last 3 are [11, 12, 13]
+    assert tail_prefill.tolist() == [[11, 12, 13]]
+
+    # Step 1 decode (offset = 6, ids = [[14]])
+    decode_ids = mx.array([[14]])
+    tail_step1 = _build_ple_tail_context(
+        tail_prefill,
+        decode_ids,
+        ctx_len=ctx_len,
+        eos=eos,
+        left_padding=left_padding,
+        offset=6,
+    )
+    assert tail_step1.tolist() == [[12, 13, 14]]
+
+
+def test_passes_qwen4_exp_gate_supports_hf_remote_inspections():
+    from types import SimpleNamespace
+    from mtplx.backends.registry import _passes_qwen4_exp_gate, _passes_mlx_lm_ar_gate
+
+    hf_inspection = SimpleNamespace(
+        source="hf",
+        model_dir="Qwen/Qwen3.8-Flash-Next-4bit",
+        model_type="qwen4_exp",
+        architecture="Qwen4ExpForConditionalGeneration",
+        model_files=("model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors"),
+    )
+    assert _passes_qwen4_exp_gate(hf_inspection) is True
+    assert _passes_mlx_lm_ar_gate(hf_inspection) is True
+
+
+def test_resolve_context_window_reads_original_max_position_from_rope_scaling(tmp_path):
+    import json
+    from mtplx.server.openai import _resolve_context_window
+
+    config_data = {
+        "max_position_embeddings": 262144,
+        "rope_scaling": {
+            "factor": 4.0,
+            "original_max_position_embeddings": 65536,
+            "type": "yarn",
+        },
+    }
+    config_file = tmp_path / "config.json"
+    config_file.write_text(json.dumps(config_data))
+
+    ctx = _resolve_context_window(None, str(tmp_path))
+    assert ctx == 262144
+
+
+def test_onboarding_scan_detects_model_mtp_head_safetensors(tmp_path):
+    from mtplx.ui.onboarding import _scan_mtp_sidecar_exists
+
+    mtp_head_file = tmp_path / "model-mtp-head.safetensors"
+    mtp_head_file.write_bytes(b"dummy")
+
+    assert _scan_mtp_sidecar_exists(tmp_path, {}) is True
+
+
+def test_is_qwen4_exp_config_recognizes_architecture_aliases():
+    from mtplx.qwen4_exp_mtp_patch import is_qwen4_exp_config
+
+    assert is_qwen4_exp_config({"architectures": ["Qwen4ExpForConditionalGeneration"]}) is True
+    assert is_qwen4_exp_config({"architectures": ["Qwen4ExpForCausalLM"]}) is True
+    assert is_qwen4_exp_config({"text_config": {"architectures": ["Qwen4ExpForConditionalGeneration"]}}) is True
+    assert is_qwen4_exp_config({"architectures": ["LlamaForCausalLM"]}) is False
 
 
 
