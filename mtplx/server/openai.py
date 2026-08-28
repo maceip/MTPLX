@@ -1658,6 +1658,17 @@ def _set_metal_memory_limit(mx: Any, name: str, value: int) -> str:
 _MODEL_RESIDENT_HEADROOM_BYTES = 4 * 1024**3
 
 
+def _resident_headroom_bytes_for_weights(weights_bytes: int) -> int:
+    """Activation headroom scaled by model weight size."""
+    weights_int = int(weights_bytes)
+    if weights_int >= 30 * 1024**3:
+        return _MODEL_RESIDENT_HEADROOM_BYTES
+    return min(
+        _MODEL_RESIDENT_HEADROOM_BYTES,
+        max(128 * 1024**2, int(weights_int * 0.08)),
+    )
+
+
 def _minimum_resident_bytes_for_model_path(model_path: str | None) -> int | None:
     """Disk shard bytes + activation headroom, or None when unknown."""
 
@@ -1673,7 +1684,9 @@ def _minimum_resident_bytes_for_model_path(model_path: str | None) -> int | None
         return None
     if not weights:
         return None
-    return int(weights) + int(_MODEL_RESIDENT_HEADROOM_BYTES)
+    weights_int = int(weights)
+    headroom = _resident_headroom_bytes_for_weights(weights_int)
+    return weights_int + int(headroom)
 
 
 def _apply_metal_memory_caps(
@@ -1745,11 +1758,16 @@ def _apply_metal_memory_caps(
             160 * 1024**3,
         )
     resident_floor = max(0, int(minimum_resident_bytes or 0))
+    system_reserve = (
+        min(16 * 1024**3, max(2 * 1024**3, int(total_ram * 0.15)))
+        if (total_ram is not None and total_ram > 0)
+        else (16 * 1024**3)
+    )
     if (
         resident_floor
         and total_ram is not None
         and total_ram > 0
-        and resident_floor + 16 * 1024**3 > total_ram
+        and resident_floor + system_reserve > total_ram
     ):
         return {
             "applied": False,
@@ -1757,7 +1775,7 @@ def _apply_metal_memory_caps(
             "total_ram_bytes": total_ram,
             "total_ram_source": total_ram_source,
             "minimum_resident_bytes": resident_floor,
-            "minimum_system_reserve_bytes": 16 * 1024**3,
+            "minimum_system_reserve_bytes": system_reserve,
         }
     mem_limit = _parse_metal_memory_size_bytes(mem_raw, default_mem)
     wired_limit = _parse_metal_memory_size_bytes(wired_raw, default_wired)
@@ -1865,16 +1883,19 @@ def apply_memory_caps_preflight(
         required_gib = (
             int(caps.get("minimum_resident_bytes") or 0) / 1024**3
         )
+        reserve_gib = (
+            int(caps.get("minimum_system_reserve_bytes") or (16 * 1024**3)) / 1024**3
+        )
         model_label = model or "The model"
         if caps.get("reason") == "configured_cap_below_model_minimum":
             raise RuntimeError(
                 f"{entry}: {model_label} cannot load inside configured Metal memory caps; "
-                f"at least {required_gib:.1f} GiB resident plus 16 GiB system headroom is required"
+                f"at least {required_gib:.1f} GiB resident plus {reserve_gib:.1f} GiB system headroom is required"
             )
         raise RuntimeError(
             f"{entry}: {model_label} cannot load inside the available Metal memory "
             f"budget; at least {required_gib:.1f} GiB resident plus "
-            "16 GiB system headroom is required"
+            f"{reserve_gib:.1f} GiB system headroom is required"
         )
     outcome: dict[str, Any] = {
         "entry": str(entry),

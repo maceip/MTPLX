@@ -1692,6 +1692,101 @@ def test_exclude_all_mtp_sidecars_from_trunk_check(tmp_path):
     assert _passes_mlx_lm_ar_gate(inspection)
 
 
+def test_attn_cache_filters_left_padding_and_lengths():
+    from mtplx.models.qwen4_exp import _AttnCache
+
+    # Create two caches and merge them
+    c1 = _AttnCache()
+    c1.keys = mx.ones((1, 2, 8, 32))
+    c1.values = mx.ones((1, 2, 8, 32))
+    c1.offset = 8
+    c1.left_padding = mx.array([2])
+    c1.lengths = mx.array([6])
+
+    c2 = _AttnCache()
+    c2.keys = mx.ones((1, 2, 8, 32))
+    c2.values = mx.ones((1, 2, 8, 32))
+    c2.offset = 8
+    c2.left_padding = mx.array([4])
+    c2.lengths = mx.array([4])
+
+    merged = _AttnCache.merge([c1, c2])
+    assert merged.left_padding.shape[0] == 2
+    assert merged.indexer.left_padding.shape[0] == 2
+
+    # Filter merged batch to keep index 1 only (BatchKVCache shifts keys and updates left_padding)
+    merged.filter(mx.array([1]))
+    assert merged.keys.shape[0] == 1
+    assert merged.left_padding.shape[0] == 1
+    assert int(merged.left_padding[0].item()) == 0
+    assert int(merged.indexer.left_padding[0].item()) == 0
+
+    # Filter unmerged _AttnCache directly
+    c_multi = _AttnCache()
+    c_multi.keys = mx.ones((2, 2, 8, 32))
+    c_multi.values = mx.ones((2, 2, 8, 32))
+    c_multi.left_padding = mx.array([2, 4])
+    c_multi.filter(mx.array([1]))
+    assert c_multi.keys.shape[0] == 1
+    assert int(c_multi.left_padding[0].item()) == 4
+
+    # Extract
+    c1_ext = c1.extract(0)
+    assert c1_ext.left_padding.shape[0] == 1
+    assert int(c1_ext.left_padding[0].item()) == 2
+
+    # Extend
+    c1_ext.extend(c2)
+    assert c1_ext.left_padding.shape[0] == 2
+    assert list(c1_ext.left_padding.tolist()) == [2, 4]
+
+
+def test_metal_memory_caps_and_headroom_scale_with_small_models(monkeypatch, tmp_path):
+    from mtplx.server.openai import (
+        _minimum_resident_bytes_for_model_path,
+        _apply_metal_memory_caps,
+        apply_memory_caps_preflight,
+    )
+
+    # 1. Headroom on 1GB weights is scaled, not fixed 4GB
+    monkeypatch.setattr("mtplx.engine_session.model_weights_bytes", lambda path: 1024**3)
+    min_resident = _minimum_resident_bytes_for_model_path(str(tmp_path))
+    assert min_resident is not None
+    assert min_resident < 2 * 1024**3  # Far below 1GB + 4GB = 5GB
+
+    # 2. Preflight on a 16GB Mac with a 2GB model passes without insufficient_ram error
+    caps = _apply_metal_memory_caps(
+        total_ram_bytes=16 * 1024**3,
+        minimum_resident_bytes=min_resident,
+    )
+    assert caps["applied"] is True
+    assert caps.get("reason") is None
+
+
+def test_qwen4_exp_mtp_falls_back_to_ar_when_draft_head_absent(tmp_path):
+    from mtplx.backends.registry import compatibility_for_inspection
+    from types import SimpleNamespace
+
+    model_dir = tmp_path / "qwen4_no_mtp"
+    model_dir.mkdir()
+    (model_dir / "model.safetensors").write_bytes(b"dummy")
+
+    inspection = SimpleNamespace(
+        model_type="qwen4_exp",
+        architecture="Qwen4ExpForConditionalGeneration",
+        mtp_num_hidden_layers=1,
+        model_dir=str(model_dir),
+        mtp=SimpleNamespace(exists=False, passes_tensor_gate=False),
+    )
+
+    verdict = compatibility_for_inspection(inspection)
+    assert verdict.can_run is True
+    assert verdict.arch_id == "qwen4-exp"
+    assert verdict.runtime_compatibility == "native-ar-only-missing-mtp"
+    assert verdict.mtp_supported == "no"
+
+
+
 
 
 

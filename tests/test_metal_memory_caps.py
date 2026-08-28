@@ -136,7 +136,7 @@ def test_minimum_resident_bytes_for_model_path_adds_headroom(tmp_path):
 
     got = openai._minimum_resident_bytes_for_model_path(str(tmp_path))
 
-    assert got == 4096 + openai._MODEL_RESIDENT_HEADROOM_BYTES
+    assert got == 4096 + openai._resident_headroom_bytes_for_weights(4096)
 
 
 def test_apply_metal_memory_caps_raises_default_wired_floor_for_laguna(

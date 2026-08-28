@@ -898,6 +898,8 @@ def _install_indexer_aware_trim(entry: Any) -> Any:
             indexer = getattr(_entry, "indexer", None)
             if indexer is not None and hasattr(indexer, "filter"):
                 indexer.filter(batch_indices)
+                if getattr(_entry, "left_padding", None) is not None:
+                    indexer.left_padding = _entry.left_padding
             reuse = getattr(_entry, "_sparse_index_reuse", None)
             if reuse is not None and hasattr(reuse, "reset"):
                 reuse.reset()

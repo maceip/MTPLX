@@ -1823,6 +1823,7 @@ class _AttnCache(KVCache):
     def __init__(self):
         super().__init__()
         self.indexer = _IndexerCache()
+        self.left_padding = None
         self._mtplx_indexer_trim = True
 
     def update_and_fetch(self, keys: Any, values: Any) -> tuple[Any, Any]:
@@ -1846,12 +1847,22 @@ class _AttnCache(KVCache):
         if self.keys is not None:
             self.keys = self.keys[batch_indices]
             self.values = self.values[batch_indices]
+        if getattr(self, "left_padding", None) is not None:
+            self.left_padding = self.left_padding[batch_indices]
+        if getattr(self, "offset", None) is not None and isinstance(self.offset, mx.array):
+            self.offset = self.offset[batch_indices]
+        if getattr(self, "lengths", None) is not None:
+            self.lengths = self.lengths[batch_indices]
+        if getattr(self, "_lengths", None) is not None:
+            self._lengths = self._lengths[batch_indices]
         if (
             hasattr(self, "indexer")
             and self.indexer is not None
             and hasattr(self.indexer, "filter")
         ):
             self.indexer.filter(batch_indices)
+            if getattr(self, "left_padding", None) is not None:
+                self.indexer.left_padding = self.left_padding
 
     def extend(self, other: Any) -> None:
         if other is None:
@@ -1865,6 +1876,40 @@ class _AttnCache(KVCache):
         elif getattr(other, "keys", None) is not None:
             self.keys = mx.concatenate([self.keys, other.keys], axis=0)
             self.values = mx.concatenate([self.values, other.values], axis=0)
+        other_lp = getattr(other, "left_padding", None)
+        if getattr(self, "left_padding", None) is not None or other_lp is not None:
+            a_batch = self.keys.shape[0] if self.keys is not None else 1
+            b_batch = other.keys.shape[0] if getattr(other, "keys", None) is not None else 1
+            a_lp = (
+                self.left_padding
+                if getattr(self, "left_padding", None) is not None
+                else mx.zeros((a_batch,), dtype=mx.int32)
+            )
+            b_lp = (
+                other_lp
+                if other_lp is not None
+                else mx.zeros((b_batch,), dtype=mx.int32)
+            )
+            self.left_padding = mx.concatenate([a_lp, b_lp], axis=0)
+        other_len = getattr(other, "lengths", None)
+        if getattr(self, "lengths", None) is not None or other_len is not None:
+            a_len = (
+                self.lengths
+                if getattr(self, "lengths", None) is not None
+                else mx.zeros(
+                    (self.keys.shape[0] if self.keys is not None else 1,),
+                    dtype=mx.int32,
+                )
+            )
+            b_len = (
+                other_len
+                if other_len is not None
+                else mx.zeros(
+                    (other.keys.shape[0] if getattr(other, "keys", None) is not None else 1,),
+                    dtype=mx.int32,
+                )
+            )
+            self.lengths = mx.concatenate([a_len, b_len], axis=0)
         if (
             hasattr(self, "indexer")
             and self.indexer is not None
@@ -1878,6 +1923,12 @@ class _AttnCache(KVCache):
             cache.keys = mx.contiguous(self.keys[idx : idx + 1])
             cache.values = mx.contiguous(self.values[idx : idx + 1])
             cache.offset = cache.keys.shape[2]
+        if getattr(self, "left_padding", None) is not None:
+            cache.left_padding = self.left_padding[idx : idx + 1]
+        if getattr(self, "lengths", None) is not None:
+            cache.lengths = self.lengths[idx : idx + 1]
+        if getattr(self, "_lengths", None) is not None:
+            cache._lengths = self._lengths[idx : idx + 1]
         if (
             hasattr(self, "indexer")
             and self.indexer is not None
@@ -1886,11 +1937,46 @@ class _AttnCache(KVCache):
             cache.indexer = self.indexer.extract(idx)
         return cache
 
+    def make_mask(self, N: int, return_array: bool = False, **kwargs):
+        if getattr(self, "left_padding", None) is not None:
+            from mlx_lm.models.cache import create_causal_mask
+
+            offset = getattr(self, "_idx", getattr(self, "offset", 0))
+            return create_causal_mask(
+                N,
+                offset=offset,
+                left_padding=self.left_padding,
+                return_array=return_array,
+                **kwargs,
+            )
+        return super().make_mask(N, return_array=return_array, **kwargs)
+
     @classmethod
     def merge(cls, caches: list[Any]):
         merged = super().merge(caches)
         indexers = [getattr(c, "indexer", None) for c in caches]
         merged.indexer = _IndexerCache.merge(indexers)
+        lps = [getattr(c, "left_padding", None) for c in caches]
+        if any(lp is not None for lp in lps):
+            lengths = [
+                getattr(c, "size", lambda: getattr(c, "offset", 0))()
+                for c in caches
+            ]
+            max_length = max(lengths) if lengths else 0
+            lp_list = []
+            for c, l in zip(caches, lengths):
+                pad_offset = max_length - l
+                c_lp = getattr(c, "left_padding", None)
+                if c_lp is not None:
+                    lp_list.append(c_lp + pad_offset)
+                else:
+                    b = (
+                        c.keys.shape[0]
+                        if getattr(c, "keys", None) is not None
+                        else 1
+                    )
+                    lp_list.append(mx.full((b,), pad_offset, dtype=mx.int32))
+            merged.left_padding = mx.concatenate(lp_list, axis=0)
         if getattr(merged, "left_padding", None) is not None:
             merged.indexer.left_padding = merged.left_padding
         from mtplx.qwen4_exp_mtp_patch import _install_indexer_aware_trim

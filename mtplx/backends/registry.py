@@ -1558,24 +1558,26 @@ def compatibility_for_inspection(inspection: Any) -> CompatibilityVerdict:
             recommended_backend=(support.backend if support else None),
             runtime_contract_path=contract_path,
             runtime_contract_error=contract_error,
-            unsafe_force_required=detected_arch_id == "qwen3-next-mtp",
+            unsafe_force_required=detected_arch_id in {"qwen3-next-mtp", "qwen4-exp-mtp"},
             unverified_model=True,
             mtp_supported="partial" if has_mtp else "no",
             runtime_compatibility=(
                 "needs-grafting"
-                if detected_arch_id == "qwen3-next-mtp"
+                if detected_arch_id in {"qwen3-next-mtp", "qwen4-exp-mtp"}
                 else (support.runtime_compatibility if support else "unsupported")
             ),
             support_level=(support.support_level if support else "unsupported"),
             support_notes=(support.notes if support else None),
         )
 
-    if detected_arch_id == "qwen3-next-mtp":
+    if detected_arch_id in {"qwen3-next-mtp", "qwen4-exp-mtp"}:
         support = architecture_support_for(detected_arch_id)
+        is_qwen4 = detected_arch_id == "qwen4-exp-mtp"
+        family_label = "Qwen4" if is_qwen4 else "Qwen"
         marker_text = (
-            "Qwen3-Next MTP markers detected"
-            if has_mtp
-            else "Qwen3-Next architecture detected"
+            f"{support.display_name} markers detected"
+            if (support and has_mtp)
+            else (f"{support.display_name} architecture detected" if support else "Qwen architecture detected")
         )
         if support is not None and _passes_family_runtime_gate(detected_arch_id, inspection, tensor_gate):
             return CompatibilityVerdict(
@@ -1587,7 +1589,7 @@ def compatibility_for_inspection(inspection: Any) -> CompatibilityVerdict:
                 exit_code=EXIT_VERIFIED,
                 message=(
                     f"{marker_text}; native MTP tensors match the supported "
-                    "Qwen family layout. No mtplx_runtime.json exactness "
+                    f"{family_label} family layout. No mtplx_runtime.json exactness "
                     "baseline is present, so runs are marked unverified until "
                     "a first-load smoke baseline is recorded."
                 ),
@@ -1639,15 +1641,16 @@ def compatibility_for_inspection(inspection: Any) -> CompatibilityVerdict:
                     support_level="native-backend-missing-model-weights",
                     support_notes=(support.notes if support else None),
                 )
+            ar_arch_id = "qwen4-exp" if is_qwen4 else detected_arch_id
             return CompatibilityVerdict(
                 tier=TIER_ARCH_COMPATIBLE_UNVERIFIED,
-                arch_id=detected_arch_id,
+                arch_id=ar_arch_id,
                 supported=False,
                 recognized=True,
                 can_run=True,
                 exit_code=EXIT_UNVERIFIED,
                 message=(
-                    f"{marker_text}, but this folder contains no Qwen MTP "
+                    f"{marker_text}, but this folder contains no {family_label} MTP "
                     "tensors (mtp.safetensors or embedded mtp.* / "
                     "language_model.mtp.* weights). mtp_heads not found -> "
                     "mtp_off: MTPLX will serve this model autoregressive, "
@@ -1672,7 +1675,7 @@ def compatibility_for_inspection(inspection: Any) -> CompatibilityVerdict:
             exit_code=EXIT_UNVERIFIED,
             message=(
                 f"{marker_text}, and an MTP artifact is present, but its tensor "
-                "layout does not match the Qwen native MTP runtime gate. "
+                f"layout does not match the {family_label} native MTP runtime gate. "
                 "mtplx_runtime.json is optional metadata; repair or regenerate "
                 "the MTP sidecar/embedded weights so the tensor gate passes."
             ),
