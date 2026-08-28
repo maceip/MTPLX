@@ -1124,6 +1124,121 @@ def test_qwen4_tuning_routes_through_batched_verifier(monkeypatch):
     assert kwargs.get("verify_core") == "stock"
 
 
+def test_sparse_index_reuse_forwards_left_padding():
+    from mtplx.models.qwen4_exp import QSAIndexer, TextArgs
+    from mtplx.qwen4_exp_mtp_patch import SparseIndexReuse
+
+    args = TextArgs(
+        hidden_size=128,
+        num_attention_heads=4,
+        head_dim=32,
+        indexer_n_heads=4,
+        indexer_head_dim=32,
+        indexer_compress_ratio=4,
+        indexer_budget=16,
+        rms_norm_eps=1e-6,
+    )
+    indexer = QSAIndexer(args)
+    wrapper = SparseIndexReuse(indexer)
+
+    B, S, H, D = 2, 1, 4, 32
+    n_blocks = 6
+    kv_len = 24
+    q = mx.ones((B, S, H, D))
+    q_pos = mx.array([kv_len - 1])
+    pooled = mx.ones((B, n_blocks, D))
+    left_padding = mx.array([16, 0])
+
+    sel = wrapper.select(q, q_pos, pooled, kv_len, left_padding=left_padding)
+    assert sel is not None
+    assert hasattr(sel, "token_idx")
+    assert hasattr(sel, "valid")
+
+
+def test_force_snapshots_in_qwen4_tuning_env(monkeypatch):
+    import os
+    from mtplx.qwen4_exp_mtp_patch import qwen4_exp_product_verify_env
+
+    # Simulate default performance-cold profile setting MTPLX_SKIP_VERIFY_SNAPSHOT=1
+    monkeypatch.setenv("MTPLX_SKIP_VERIFY_SNAPSHOT", "1")
+
+    with qwen4_exp_product_verify_env(None) as strategy:
+        assert strategy == "batched"
+        assert os.environ.get("MTPLX_SKIP_VERIFY_SNAPSHOT") == "0"
+
+    # Restored after context exit
+    assert os.environ.get("MTPLX_SKIP_VERIFY_SNAPSHOT") == "1"
+
+
+def test_recognize_all_qwen4_configurations_in_tuning(monkeypatch):
+    import mtplx.artifacts
+    from mtplx.benchmarks.runners import mtp_depth_sweep
+    from mtplx.commands import public
+    from mtplx.server import openai
+
+    mock_run_sweep = MagicMock(return_value={"ok": True})
+    monkeypatch.setattr(mtp_depth_sweep, "run_mtp_depth_sweep", mock_run_sweep)
+    monkeypatch.setattr(openai, "apply_memory_caps_preflight", lambda **kwargs: {})
+
+    # Mock inspect_model to return model_type="qwen4_exp_text" and architecture="Qwen4ExpForCausalLM"
+    mock_inspection = SimpleNamespace(
+        model_type="qwen4_exp_text",
+        architecture="Qwen4ExpForCausalLM",
+    )
+    monkeypatch.setattr(mtplx.artifacts, "inspect_model", lambda model_path: mock_inspection)
+    monkeypatch.setattr(public, "inspect_model", lambda model_path: mock_inspection)
+
+    public._depth_sweep_native60(
+        model="/tmp/dummy-qwen4-custom",
+        prompt_suite="dummy",
+        depths="1",
+        max_tokens=10,
+        limit=1,
+        seed=0,
+    )
+
+    assert mock_run_sweep.called
+    kwargs = mock_run_sweep.call_args.kwargs
+    assert kwargs.get("verify_strategy") == "batched"
+    assert kwargs.get("verify_core") == "stock"
+
+
+def test_tensor_offset_paged_cache_update_and_fetch_contract():
+    from mtplx.cache_state import (
+        TensorOffsetVllmMetalPagedKVCache,
+        VllmMetalPagedKVCache,
+    )
+    from mtplx.models.qwen4_exp import _IndexerCache
+
+    paged = VllmMetalPagedKVCache(block_size=16, num_blocks=4)
+    paged.indexer = _IndexerCache()
+    paged.indexer.update(mx.ones((1, 8, 128)))
+
+    # Populate initial paged state
+    keys = mx.ones((1, 2, 4, 64))
+    values = mx.ones((1, 2, 4, 64))
+    paged.update_without_fetch(keys, values)
+
+    promoted = TensorOffsetVllmMetalPagedKVCache.from_paged_cache(paged)
+    assert hasattr(promoted, "indexer")
+
+    # .state property returns (keys, values, indexer_keys) (3 elements for snapshotting)
+    assert len(promoted.state) == 3
+
+    # update_and_fetch() MUST return a 2-tuple (k, v) to satisfy the Attention contract
+    new_keys = mx.ones((1, 2, 1, 64))
+    new_values = mx.ones((1, 2, 1, 64))
+    res = promoted.update_and_fetch(new_keys, new_values)
+    assert isinstance(res, tuple)
+    assert len(res) == 2
+    k, v = res
+    assert k.shape[0] == 1
+    assert k.shape[1] == 2
+    assert v.shape[0] == 1
+    assert v.shape[1] == 2
+
+
+
 
 
 

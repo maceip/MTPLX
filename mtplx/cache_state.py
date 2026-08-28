@@ -2845,7 +2845,9 @@ class TensorOffsetVllmMetalPagedKVCache:
 
     def update_and_fetch(self, keys: Any, values: Any) -> tuple[Any, Any]:
         self.update_without_fetch(keys, values)
-        return self.state
+        flat_k = self._flat_key_cache()
+        flat_v = self._flat_value_cache()
+        return flat_k.transpose(1, 0, 2)[None, ...], flat_v.transpose(1, 0, 2)[None, ...]
 
     def make_mask(self, N: int, window_size=None, return_array: bool = False):
         import mlx.core as mx

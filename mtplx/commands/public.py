@@ -2180,10 +2180,18 @@ def _depth_sweep_native60(
 
     try:
         inspection = inspect_model(model)
+        m_type = str(getattr(inspection, "model_type", "") or "").lower()
+        arch = str(getattr(inspection, "architecture", "") or "").lower()
         is_qwen4 = (
-            getattr(inspection, "model_type", None) == "qwen4_exp"
+            m_type in {"qwen4_exp", "qwen4_exp_text", "qwen4exp", "qwen4", "qwen4-exp"}
+            or "qwen4exp" in arch
+            or "qwen4" in arch
             or getattr(inspection, "architecture", None)
-            == "Qwen4ExpForConditionalGeneration"
+            in {
+                "Qwen4ExpForConditionalGeneration",
+                "Qwen4ExpForCausalLM",
+                "Qwen4ForCausalLM",
+            }
         )
     except Exception:
         is_qwen4 = "qwen4" in str(model).lower() or "qwen3.8" in str(model).lower()

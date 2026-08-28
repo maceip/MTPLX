@@ -305,8 +305,10 @@ class SparseIndexReuse:
     def prepare(self, x, rope, cache, offset: int):
         return self.indexer.prepare(x, rope, cache, offset)
 
-    def select(self, q, q_pos, pooled, kv_len):
-        return self.indexer.select(q, q_pos, pooled, kv_len)
+    def select(self, q, q_pos, pooled, kv_len, left_padding=None, *args, **kwargs):
+        return self.indexer.select(
+            q, q_pos, pooled, kv_len, left_padding=left_padding, *args, **kwargs
+        )
 
     def __call__(self, x, rope, cache, offset: int):
         import mlx.core as mx
@@ -1079,7 +1081,9 @@ def qwen4_exp_product_verify_strategy(model: Any) -> str | None:
     is batched verify with a live snapshot. Returns None for other models.
     """
     if model is None:
-        return None
+        return "batched"
+    if isinstance(model, (str, Path)):
+        return "batched"
     inner = _inner_model(model)
     if not getattr(inner, "_mtplx_qwen4_exp_capture", False):
         return None
@@ -1087,7 +1091,7 @@ def qwen4_exp_product_verify_strategy(model: Any) -> str | None:
 
 
 @contextlib.contextmanager
-def qwen4_exp_product_verify_env(model: Any):
+def qwen4_exp_product_verify_env(model: Any = None):
     """Yield the product verify_strategy, forcing a live snapshot for qwen4_exp."""
     strategy = qwen4_exp_product_verify_strategy(model)
     if strategy is None:
