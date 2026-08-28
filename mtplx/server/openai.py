@@ -84,10 +84,12 @@ from mtplx.mtp_batch_numerics import (
 from mtplx.backends.descriptors import (
     BackendDescriptor,
     ReasoningCodec,
+    QWEN4_EXP_DRAFT_SEMANTICS,
     assistant_target_distribution_choices,
     descriptor_for_backend_id,
     descriptor_for_model,
     descriptor_from_runtime,
+    draft_semantics_for_model,
     model_controls_for_descriptor,
     model_family_from_inspection,
     reasoning_policy_for_model,
@@ -2195,12 +2197,10 @@ class ServerState:
         _startup_line(f"[5/6] Model loaded in {self.load_time_s:.1f}s")
         self.backend_descriptor = descriptor_from_runtime(self.runtime, args)
         args.backend_id = self.backend_descriptor.backend_id
-        if not getattr(args, "_explicit_depth", False):
-            set_draft_control_arg(
-                args,
-                self.backend_descriptor,
-                int(self.backend_descriptor.draft_semantics.default),
-            )
+        from mtplx.backends.descriptors import (
+            QWEN4_EXP_DRAFT_SEMANTICS,
+            draft_semantics_for_model,
+        )
         from mtplx.qwen4_exp_mtp_patch import qwen4_exp_product_verify_strategy
 
         qwen4_verify = qwen4_exp_product_verify_strategy(
@@ -2209,6 +2209,18 @@ class ServerState:
         if qwen4_verify is not None:
             args.verify_strategy = qwen4_verify
             os.environ["MTPLX_SKIP_VERIFY_SNAPSHOT"] = "0"
+            loaded_draft_semantics = QWEN4_EXP_DRAFT_SEMANTICS
+        else:
+            loaded_draft_semantics = draft_semantics_for_model(
+                model_ref=getattr(args, "model", None) or getattr(args, "model_id", None),
+                descriptor=self.backend_descriptor,
+            )
+        if not getattr(args, "_explicit_depth", False):
+            set_draft_control_arg(
+                args,
+                self.backend_descriptor,
+                int(loaded_draft_semantics.default),
+            )
         if self.backend_descriptor.uses_draft_lm_head:
             _startup_line("[5/6] Installing native-MTP draft head")
         else:
@@ -31831,15 +31843,19 @@ def _apply_backend_server_defaults(
         and backend.reasoning_codec.default_effort
     ):
         args.reasoning_effort = backend.reasoning_codec.default_effort
+    draft_sem = draft_semantics_for_model(
+        model_ref=getattr(args, "model", None) or getattr(args, "model_id", None),
+        descriptor=backend,
+    )
     if not _server_flag_present(
         explicit_flags,
         "depth",
         "mtp-depth",
         "speculative-depth",
-        backend.draft_semantics.request_field,
+        draft_sem.request_field,
     ):
         args._explicit_depth = False
-        set_draft_control_arg(args, backend, int(backend.draft_semantics.default))
+        set_draft_control_arg(args, backend, int(draft_sem.default))
     else:
         args._explicit_depth = True
     if backend.backend_id != GEMMA4_BACKEND:

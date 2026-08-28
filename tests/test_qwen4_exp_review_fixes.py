@@ -1786,6 +1786,108 @@ def test_qwen4_exp_mtp_falls_back_to_ar_when_draft_head_absent(tmp_path):
     assert verdict.mtp_supported == "no"
 
 
+def test_gdn_and_ple_preserve_conv_history_through_partial_padding():
+    from mtplx.models.qwen4_exp import GatedDeltaNet, PLELayer, TextArgs, ArraysCache
+
+    args = TextArgs(
+        hidden_size=64,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        head_dim=32,
+        linear_num_key_heads=2,
+        linear_num_value_heads=2,
+        linear_key_head_dim=16,
+        linear_value_head_dim=16,
+        linear_conv_kernel_dim=4,
+        hc_count=2,
+        hc_lowrank=32,
+        ple_embed_dim=64,
+        ple_layer_ids=[0],
+        ngram_size=2,
+        vocab_size=50,
+    )
+    gdn = GatedDeltaNet(args)
+    cache = ArraysCache(4)
+
+    # Initial step to populate history
+    x_init = mx.ones((2, 3, 64))
+    _ = gdn(x_init, mask=None, cache=cache)
+    initial_slot0 = mx.array(cache[0])
+
+    # Next step with 2 batch rows:
+    # row 0: partially masked [False, True, True]
+    # row 1: fully masked [False, False, False]
+    x_step = mx.ones((2, 3, 64)) * 2.0
+    mask = mx.array([[False, True, True], [False, False, False]])
+    out = gdn(x_step, mask=mask, cache=cache)
+
+    assert out.shape == (2, 3, 64)
+    # Row 1 is fully masked, so output is 0 and slot0 is unchanged
+    assert mx.all(out[1] == 0)
+    assert mx.all(cache[0][1] == initial_slot0[1])
+
+    # Row 0 advanced by 2 valid timesteps without zero-padding contamination
+    # slot0 has length conv_kernel_size - 1 = 3
+    # last 2 elements of cache[0][0] come from valid tokens of x_step, first element from initial_slot0[0]
+    assert cache[0].shape == (2, 3, gdn.conv_dim)
+
+
+def test_attn_cache_extend_without_left_padding_receiver():
+    from mtplx.models.qwen4_exp import _AttnCache
+
+    # Receiver has no left_padding (batch size 2)
+    c1 = _AttnCache()
+    c1.keys = mx.ones((2, 2, 8, 32))
+    c1.values = mx.ones((2, 2, 8, 32))
+
+    # Other has left_padding (batch size 1)
+    c2 = _AttnCache()
+    c2.keys = mx.ones((1, 2, 8, 32))
+    c2.values = mx.ones((1, 2, 8, 32))
+    c2.left_padding = mx.array([3], dtype=mx.int32)
+
+    c1.extend(c2)
+    assert c1.keys.shape[0] == 3
+    # left_padding must have length 3 (2 for receiver, 1 for other), not 4
+    assert c1.left_padding.shape[0] == 3
+    assert list(c1.left_padding.tolist()) == [0, 0, 3]
+
+
+def test_load_raw_sidecar_transposes_conv1d_weights(tmp_path):
+    from mtplx.qwen4_exp_mtp_patch import _load_mtp_weights
+
+    sidecar_path = tmp_path / "mtp.safetensors"
+    # Raw HF conv1d weight layout: (C, 1, K)
+    dummy_weights = {
+        "mtp.layers.0.linear_attn.conv1d.weight": mx.ones((16, 1, 4)),
+    }
+    mx.save_safetensors(str(sidecar_path), dummy_weights)
+
+    loaded = _load_mtp_weights([sidecar_path])
+    conv_w = loaded["layers.0.linear_attn.conv1d.weight"]
+    # MLX Conv1d weight layout: (C, K, 1)
+    assert conv_w.shape == (16, 4, 1)
+
+
+def test_qwen4_server_retains_d1_default_when_not_explicit():
+    from argparse import Namespace
+    from mtplx.server.openai import _apply_backend_server_defaults, parse_args
+    from mtplx.backends.descriptors import QWEN3_NEXT_DESCRIPTOR
+
+    # When serving Qwen4 without explicit --depth flag
+    args = Namespace(
+        model="Qwen/Qwen3.8-Flash-Next",
+        model_id="Qwen/Qwen3.8-Flash-Next",
+        backend="qwen3_next",
+    )
+    explicit_flags = set()
+    _apply_backend_server_defaults(args, explicit_flags=explicit_flags)
+    assert getattr(args, "_explicit_depth", False) is False
+    assert getattr(args, "depth", None) == 1
+
+
+
 
 
 

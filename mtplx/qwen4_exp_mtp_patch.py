@@ -217,6 +217,16 @@ def _split_eh_proj_weights(weights: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def _transpose_mtp_conv_weights(weights: dict[str, Any]) -> dict[str, Any]:
+    out = {}
+    for k, v in weights.items():
+        if "conv1d.weight" in k and getattr(v, "ndim", 0) == 3 and v.shape[-1] != 1:
+            if v.shape[1] == 1:
+                v = v.transpose(0, 2, 1)
+        out[k] = v
+    return out
+
+
 def _process_raw_mtp_weights(
     raw: dict[str, Any], is_mlx_format: bool = False
 ) -> dict[str, Any]:
@@ -231,7 +241,8 @@ def _process_raw_mtp_weights(
     remapped = _split_eh_proj_weights(remapped)
     if is_mlx_format:
         return remapped
-    return _shift_qwen4_gemma_mtp_norms(remapped)
+    transposed = _transpose_mtp_conv_weights(remapped)
+    return _shift_qwen4_gemma_mtp_norms(transposed)
 
 
 def _load_mtp_weights(paths: list[Path]) -> dict[str, Any]:
@@ -257,7 +268,8 @@ def _load_mtp_weights(paths: list[Path]) -> dict[str, Any]:
     remapped = _split_eh_proj_weights(remapped)
     if is_mlx_format:
         return remapped
-    return _shift_qwen4_gemma_mtp_norms(remapped)
+    transposed = _transpose_mtp_conv_weights(remapped)
+    return _shift_qwen4_gemma_mtp_norms(transposed)
 
 
 # Qwen4ExpTextRMSNorm is Gemma-style ``(1 + weight)`` with zero init. MLX

@@ -987,22 +987,58 @@ class GatedDeltaNet(nn.Module):
             if slot0 is not None
             else mx.zeros((B, self.conv_kernel_size - 1, self.conv_dim), dtype=x.dtype)
         )
-        if mask is not None:
-            mixed_qkv = mx.where(mask[..., None], mixed_qkv, 0)
-        conv_input = mx.concatenate([conv_state, mixed_qkv], axis=1)
-        if cache is not None:
-            new_slot0 = mx.contiguous(
-                conv_input[:, -(self.conv_kernel_size - 1) :, :]
-            )
-            if mask is not None:
-                row_active = (
-                    mask.any(axis=-1, keepdims=True)
-                    if mask.ndim > 1
-                    else mask[:, None]
+        K_minus_1 = self.conv_kernel_size - 1
+        if mask is None:
+            conv_input = mx.concatenate([conv_state, mixed_qkv], axis=1)
+            if cache is not None:
+                _set_cache_slot(
+                    cache,
+                    0,
+                    mx.contiguous(conv_input[:, -K_minus_1:, :]),
                 )
+            conv_out = nn.silu(self.conv1d(conv_input))
+        elif S == 1:
+            row_active = (
+                mask.any(axis=-1, keepdims=True)
+                if mask.ndim > 1
+                else mask[:, None]
+            )
+            mixed_qkv_active = mx.where(mask[..., None], mixed_qkv, 0)
+            conv_input = mx.concatenate([conv_state, mixed_qkv_active], axis=1)
+            if cache is not None:
+                new_slot0 = mx.contiguous(conv_input[:, -K_minus_1:, :])
                 new_slot0 = mx.where(row_active[..., None], new_slot0, conv_state)
-            _set_cache_slot(cache, 0, new_slot0)
-        conv_out = nn.silu(self.conv1d(conv_input))
+                _set_cache_slot(cache, 0, new_slot0)
+            conv_out = nn.silu(self.conv1d(conv_input))
+            conv_out = mx.where(mask[..., None], conv_out, 0)
+        else:
+            conv_out_rows = []
+            new_slot0_rows = []
+            for i in range(B):
+                m_i = mask[i] if mask.ndim > 1 else mask
+                row_qkv = mixed_qkv[i]
+                c_state_i = conv_state[i : i + 1]
+                m_list = m_i.tolist() if hasattr(m_i, "tolist") else list(m_i)
+                valid_idx = [idx for idx, v in enumerate(m_list) if v]
+                n_valid = len(valid_idx)
+                if n_valid == 0:
+                    conv_out_rows.append(mx.zeros((1, S, self.conv_dim), dtype=x.dtype))
+                    new_slot0_rows.append(c_state_i)
+                elif n_valid == S:
+                    c_inp = mx.concatenate([c_state_i, row_qkv[None, ...]], axis=1)
+                    new_slot0_rows.append(mx.contiguous(c_inp[:, -K_minus_1:, :]))
+                    conv_out_rows.append(nn.silu(self.conv1d(c_inp)))
+                else:
+                    valid_qkv = row_qkv[valid_idx][None, ...]
+                    c_inp = mx.concatenate([c_state_i, valid_qkv], axis=1)
+                    new_slot0_rows.append(mx.contiguous(c_inp[:, -K_minus_1:, :]))
+                    v_out = nn.silu(self.conv1d(c_inp))
+                    full_out = mx.zeros((1, S, self.conv_dim), dtype=x.dtype)
+                    full_out[:, valid_idx] = v_out
+                    conv_out_rows.append(full_out)
+            if cache is not None:
+                _set_cache_slot(cache, 0, mx.concatenate(new_slot0_rows, axis=0))
+            conv_out = mx.concatenate(conv_out_rows, axis=0)
 
         q, k, v = mx.split(conv_out, [self.key_dim, 2 * self.key_dim], axis=-1)
         q = q.reshape(B, S, self.n_k, self.dk)
@@ -1367,31 +1403,64 @@ class PLELayer(nn.Module):
         )
 
     def _short_conv(self, x: mx.array, cache: Any, mask: Any = None) -> mx.array:
-        S = x.shape[1]
+        B, S, _ = x.shape
         n = self.short_conv_state_len
         slot = _cache_slot(cache, 2)
         state = (
             slot
             if slot is not None
-            else mx.zeros((x.shape[0], n, x.shape[-1]), dtype=x.dtype)
+            else mx.zeros((B, n, x.shape[-1]), dtype=x.dtype)
         )
-        if mask is not None:
-            x = mx.where(mask[..., None], x, 0)
-        full = mx.concatenate([state, x], axis=1)
-        if cache is not None:
-            new_slot2 = mx.contiguous(full[:, -n:, :])
-            if mask is not None:
-                row_active = (
-                    mask.any(axis=-1, keepdims=True)
-                    if mask.ndim > 1
-                    else mask[:, None]
-                )
+        if mask is None:
+            full = mx.concatenate([state, x], axis=1)
+            if cache is not None:
+                _set_cache_slot(cache, 2, mx.contiguous(full[:, -n:, :]))
+            out = nn.silu(self.conv1d(full[:, -(n + S) :, :]))
+            return out
+        elif S == 1:
+            row_active = (
+                mask.any(axis=-1, keepdims=True)
+                if mask.ndim > 1
+                else mask[:, None]
+            )
+            x_active = mx.where(mask[..., None], x, 0)
+            full = mx.concatenate([state, x_active], axis=1)
+            if cache is not None:
+                new_slot2 = mx.contiguous(full[:, -n:, :])
                 new_slot2 = mx.where(row_active[..., None], new_slot2, state)
-            _set_cache_slot(cache, 2, new_slot2)
-        out = nn.silu(self.conv1d(full[:, -(n + S) :, :]))
-        if mask is not None:
+                _set_cache_slot(cache, 2, new_slot2)
+            out = nn.silu(self.conv1d(full[:, -(n + S) :, :]))
             out = mx.where(mask[..., None], out, 0)
-        return out
+            return out
+        else:
+            out_rows = []
+            new_slot2_rows = []
+            for i in range(B):
+                m_i = mask[i] if mask.ndim > 1 else mask
+                row_x = x[i]
+                s_i = state[i : i + 1]
+                m_list = m_i.tolist() if hasattr(m_i, "tolist") else list(m_i)
+                valid_idx = [idx for idx, v in enumerate(m_list) if v]
+                n_valid = len(valid_idx)
+                if n_valid == 0:
+                    out_rows.append(mx.zeros((1, S, x.shape[-1]), dtype=x.dtype))
+                    new_slot2_rows.append(s_i)
+                elif n_valid == S:
+                    full_i = mx.concatenate([s_i, row_x[None, ...]], axis=1)
+                    new_slot2_rows.append(mx.contiguous(full_i[:, -n:, :]))
+                    out_rows.append(nn.silu(self.conv1d(full_i[:, -(n + S) :, :])))
+                else:
+                    valid_x = row_x[valid_idx][None, ...]
+                    full_i = mx.concatenate([s_i, valid_x], axis=1)
+                    new_slot2_rows.append(mx.contiguous(full_i[:, -n:, :]))
+                    v_out = nn.silu(self.conv1d(full_i[:, -(n + n_valid) :, :]))
+                    full_out = mx.zeros((1, S, x.shape[-1]), dtype=x.dtype)
+                    full_out[:, valid_idx] = v_out
+                    out_rows.append(full_out)
+
+            if cache is not None:
+                _set_cache_slot(cache, 2, mx.concatenate(new_slot2_rows, axis=0))
+            return mx.concatenate(out_rows, axis=0)
 
     def __call__(
         self,
@@ -1867,6 +1936,8 @@ class _AttnCache(KVCache):
     def extend(self, other: Any) -> None:
         if other is None:
             return
+        a_batch = self.keys.shape[0] if self.keys is not None else 1
+        b_batch = other.keys.shape[0] if getattr(other, "keys", None) is not None else 1
         if self.keys is None and getattr(other, "keys", None) is None:
             pass
         elif self.keys is None:
@@ -1878,8 +1949,6 @@ class _AttnCache(KVCache):
             self.values = mx.concatenate([self.values, other.values], axis=0)
         other_lp = getattr(other, "left_padding", None)
         if getattr(self, "left_padding", None) is not None or other_lp is not None:
-            a_batch = self.keys.shape[0] if self.keys is not None else 1
-            b_batch = other.keys.shape[0] if getattr(other, "keys", None) is not None else 1
             a_lp = (
                 self.left_padding
                 if getattr(self, "left_padding", None) is not None
@@ -1897,7 +1966,7 @@ class _AttnCache(KVCache):
                 self.lengths
                 if getattr(self, "lengths", None) is not None
                 else mx.zeros(
-                    (self.keys.shape[0] if self.keys is not None else 1,),
+                    (a_batch,),
                     dtype=mx.int32,
                 )
             )
@@ -1905,7 +1974,7 @@ class _AttnCache(KVCache):
                 other_len
                 if other_len is not None
                 else mx.zeros(
-                    (other.keys.shape[0] if getattr(other, "keys", None) is not None else 1,),
+                    (b_batch,),
                     dtype=mx.int32,
                 )
             )
