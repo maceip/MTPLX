@@ -646,6 +646,120 @@ class Qwen4ExpRecurrentCache:
                 break
             self.cache[idx] = item
 
+    @property
+    def batch_size(self) -> int:
+        for c in self.cache:
+            if c is not None:
+                return int(c.shape[0])
+        if self.left_padding is not None:
+            return int(self.left_padding.size)
+        elif self.lengths is not None:
+            return int(self.lengths.size)
+        return 1
+
+    def filter(self, batch_indices: Any) -> None:
+        self.cache = [c[batch_indices] if c is not None else None for c in self.cache]
+        if self.left_padding is not None:
+            self.left_padding = self.left_padding[batch_indices]
+        if self.lengths is not None:
+            self.lengths = self.lengths[batch_indices]
+
+    def extend(self, other: Any) -> None:
+        import mlx.core as mx
+
+        a_batch = self.batch_size
+        b_batch = getattr(other, "batch_size", 1)
+
+        def cat(a: Any, b: Any) -> Any:
+            shape = dtype = None
+            if a is not None:
+                shape = a.shape
+                dtype = a.dtype
+            if b is not None:
+                shape = b.shape
+                dtype = b.dtype
+
+            if shape is None:
+                return None
+
+            if a is None:
+                a = mx.zeros((a_batch,) + shape[1:], dtype=dtype)
+            if b is None:
+                b = mx.zeros((b_batch,) + shape[1:], dtype=dtype)
+
+            return mx.concatenate([a, b])
+
+        other_cache = getattr(other, "cache", getattr(other, "state", []))
+        self.cache = [cat(c, o) for c, o in zip(self.cache, other_cache)]
+        self.left_padding = cat(self.left_padding, getattr(other, "left_padding", None))
+        self.lengths = cat(self.lengths, getattr(other, "lengths", None))
+
+    def extract(self, idx: int) -> "Qwen4ExpRecurrentCache":
+        cache = Qwen4ExpRecurrentCache(len(self.cache))
+        cache.cache = [c[idx : idx + 1] if c is not None else None for c in self.cache]
+        cache.left_padding = (
+            self.left_padding[idx : idx + 1]
+            if self.left_padding is not None
+            else None
+        )
+        cache.lengths = (
+            self.lengths[idx : idx + 1]
+            if self.lengths is not None
+            else None
+        )
+        return cache
+
+    def prepare(self, lengths=None, left_padding=None, **kwargs) -> None:
+        import mlx.core as mx
+
+        if lengths is not None:
+            self.lengths = (
+                mx.array(lengths) if not isinstance(lengths, mx.array) else lengths
+            )
+        if left_padding is not None:
+            self.left_padding = (
+                mx.array(left_padding)
+                if not isinstance(left_padding, mx.array)
+                else left_padding
+            )
+
+    def finalize(self) -> None:
+        self.lengths = None
+        self.left_padding = None
+
+    @classmethod
+    def merge(cls, caches):
+        import mlx.core as mx
+
+        n_state = len(caches[0].cache)
+        B = len(caches)
+        cache = cls(n_state)
+
+        if all(c.empty() for c in caches):
+            cache.left_padding = mx.array([0] * B)
+            return cache
+
+        for e in range(n_state):
+            c_init = next((c[e] for c in caches if c[e] is not None), None)
+            if c_init is None:
+                continue
+            shape = list(c_init.shape)
+            shape[0] = B
+            cache[e] = mx.zeros(shape, c_init.dtype)
+            for i in range(B):
+                if caches[i][e] is None:
+                    continue
+                cache[e][i : i + 1] = caches[i][e]
+        return cache
+
+    @property
+    def nbytes(self) -> int:
+        total = 0
+        for c in self.cache:
+            if c is not None:
+                total += int(c.nbytes)
+        return total
+
     def is_trimmable(self) -> bool:
         return False
 

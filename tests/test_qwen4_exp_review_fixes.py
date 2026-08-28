@@ -773,5 +773,93 @@ def test_rope_scaling_normalized_into_rope_parameters():
     assert abs(model.model.rope.mscale - (0.1 * math.log(4.0) + 1.0)) < 1e-4
 
 
+def test_qwen4_exp_recurrent_cache_batch_protocol():
+    from mtplx.qwen4_exp_mtp_patch import Qwen4ExpRecurrentCache
+
+    # 1. Initialization and batch_size
+    c1 = Qwen4ExpRecurrentCache(4)
+    c1[0] = mx.ones((2, 3, 128))
+    c1[1] = mx.ones((2, 4, 32, 32))
+    c1.left_padding = mx.array([2, 0])
+    c1.lengths = mx.array([8, 10])
+    assert c1.batch_size == 2
+
+    # 2. Extract
+    extracted = c1.extract(1)
+    assert extracted.batch_size == 1
+    assert extracted[0].shape == (1, 3, 128)
+    assert extracted.left_padding[0].item() == 0
+    assert extracted.lengths[0].item() == 10
+
+    # 3. Filter
+    c1.filter(mx.array([1]))
+    assert c1.batch_size == 1
+    assert c1[0].shape == (1, 3, 128)
+    assert c1.left_padding[0].item() == 0
+    assert c1.lengths[0].item() == 10
+
+    # 4. Extend
+    c2 = Qwen4ExpRecurrentCache(4)
+    c2[0] = mx.full((1, 3, 128), 2.0)
+    c2[1] = mx.full((1, 4, 32, 32), 2.0)
+    c2.left_padding = mx.array([1])
+    c2.lengths = mx.array([6])
+
+    c1.extend(c2)
+    assert c1.batch_size == 2
+    assert c1[0].shape == (2, 3, 128)
+    assert c1.left_padding.tolist() == [0, 1]
+    assert c1.lengths.tolist() == [10, 6]
+
+    # 5. Prepare & Finalize
+    c1.prepare(lengths=[5, 5], left_padding=[0, 0])
+    assert c1.lengths.tolist() == [5, 5]
+    assert c1.left_padding.tolist() == [0, 0]
+    c1.finalize()
+    assert c1.lengths is None
+    assert c1.left_padding is None
+
+
+def test_compiled_linear_step_passes_recurrent_mask():
+    from mtplx.models.qwen4_exp import DecoderLayer, ModelArgs, TextArgs
+    from mtplx.models.qwen4_exp_compiled import (
+        CompiledLayerRunner,
+        compile_linear_layer_step,
+    )
+
+    args = TextArgs(
+        hidden_size=128,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=32,
+        linear_num_key_heads=4,
+        linear_num_value_heads=4,
+        linear_key_head_dim=32,
+        linear_value_head_dim=32,
+        linear_conv_kernel_dim=4,
+        hc_count=2,
+        hc_lowrank=64,
+        moe_intermediate_size=64,
+        shared_expert_intermediate_size=64,
+        num_experts=4,
+        num_experts_per_tok=2,
+        layer_types=["linear_attention", "full_attention"],
+    )
+    layer = DecoderLayer(args, layer_idx=0)
+    step_fn = compile_linear_layer_step(layer)
+
+    h = mx.ones((2, 1, 128 * 2))
+    conv_mask = mx.array([[False], [True]])
+    conv_state = mx.zeros((2, 3, layer.linear_attn.conv_dim))
+    rec_state = mx.zeros((2, layer.linear_attn.n_v, layer.linear_attn.dv, layer.linear_attn.dk))
+
+    h_out, new_conv, new_rec = step_fn(h, conv_mask, conv_state, rec_state)
+    assert h_out.shape == (2, 1, 128 * 2)
+    assert new_conv.shape == (2, 3, layer.linear_attn.conv_dim)
+    assert new_rec.shape == (2, layer.linear_attn.n_v, layer.linear_attn.dv, layer.linear_attn.dk)
+
+
+
 
 

@@ -123,7 +123,7 @@ def compile_moe_step(moe_layer: Any) -> Callable[[mx.array], mx.array]:
 
 def compile_linear_layer_step(
     layer: Any,
-) -> Callable[[mx.array, mx.array, mx.array], Tuple[mx.array, mx.array, mx.array]]:
+) -> Callable[[mx.array, Any, mx.array, mx.array], Tuple[mx.array, mx.array, mx.array]]:
     """Compile full single-token step for a linear attention decoder layer.
 
     Fuses attn_hyper_connection -> GatedDeltaNet -> residual ->
@@ -134,16 +134,16 @@ def compile_linear_layer_step(
         layer: DecoderLayer instance where layer_type == "linear_attention".
 
     Returns:
-        Compiled function taking (h, conv_state, rec_state) and returning
+        Compiled function taking (h, conv_mask, conv_state, rec_state) and returning
         (h_out, new_conv_state, new_rec_state).
     """
 
     def linear_step(
-        h: mx.array, conv_state: mx.array, rec_state: mx.array
+        h: mx.array, conv_mask: Any, conv_state: mx.array, rec_state: mx.array
     ) -> Tuple[mx.array, mx.array, mx.array]:
         x, hyper, inject = layer.attn_hyper_connection(h)
         carrier = GDNCarrier(conv_state, rec_state)
-        x = layer.linear_attn(x, None, carrier)
+        x = layer.linear_attn(x, conv_mask, carrier)
         h_mid = hyper + (x[..., None, :] * inject[..., None]).reshape(
             *x.shape[:-1], -1
         )
@@ -270,7 +270,7 @@ class CompiledLayerRunner:
                     )
                 )
 
-                h, new_c, new_r = runner["step"](h, conv_state, rec_state)
+                h, new_c, new_r = runner["step"](h, conv_mask, conv_state, rec_state)
 
                 if c is not None:
                     c[0] = new_c
