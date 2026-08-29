@@ -1909,6 +1909,28 @@ def draft_tokens(
     return drafts, qs, h
 
 
+def _rebuild_exact_mtp_cells(
+    model: Any,
+    mtp_cache: Any,
+    mtp_snaps: list[StateSnapshot],
+    step_hiddens: list[Any],
+    accepted: list[int],
+) -> None:
+    import mlx.core as mx
+
+    if mtp_cache is None or not mtp_snaps:
+        return
+    mtp_snaps[0].restore(mtp_cache)
+    for j, tok in enumerate(accepted):
+        if j < len(step_hiddens):
+            _logits, _h = model.mtp_forward(
+                step_hiddens[j],
+                mx.array([[int(tok)]], dtype=mx.int32),
+                mtp_cache=mtp_cache,
+            )
+            mx.eval(_logits, _h)
+
+
 def speculative_generate(
     model: Any,
     prompt_ids,
@@ -1987,8 +2009,9 @@ def speculative_generate(
                 correction = int(decision.token_id)
                 # Instant zero-replay rollback: restore state to position i (after primary + accepted[:i])
                 step_snapshots[i].restore(cache)
-                if mtp_cache is not None and i < len(mtp_snaps):
-                    mtp_snaps[i].restore(mtp_cache)
+                _rebuild_exact_mtp_cells(
+                    model, mtp_cache, mtp_snaps, step_hiddens, accepted
+                )
                 hidden = step_hiddens[i]
                 tokens.extend(accepted)
                 tokens.append(int(correction))
@@ -1997,6 +2020,9 @@ def speculative_generate(
 
         if correction is None:
             tokens.extend(accepted)
+            _rebuild_exact_mtp_cells(
+                model, mtp_cache, mtp_snaps, step_hiddens, accepted
+            )
             if len(tokens) < max_tokens:
                 bonus, _ = sample_logits_row(
                     last_logits[0, -1], temperature=temperature, rng=rng

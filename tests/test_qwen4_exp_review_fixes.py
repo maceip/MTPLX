@@ -2305,6 +2305,65 @@ def test_classify_scanned_model_recognizes_top_level_mtp_num_hidden_layers(tmp_p
     assert scanned.arch_id == "qwen4-exp-mtp"
 
 
+def test_expected_mtp_file_finds_model_mtp_head_safetensors(tmp_path):
+    from mtplx.artifacts import expected_mtp_file, mtp_weights_present_on_disk
+
+    sidecar = tmp_path / "model-mtp-head.safetensors"
+    sidecar.write_bytes(b"dummy")
+
+    assert expected_mtp_file(tmp_path).name == "model-mtp-head.safetensors"
+    assert mtp_weights_present_on_disk(tmp_path, {}) is True
+
+
+def test_sanitize_and_mtp_remap_bare_hyper_connection_weights():
+    from mtplx.models.qwen4_exp import sanitize
+    from mtplx.qwen4_exp_mtp_patch import _process_raw_mtp_weights
+
+    raw_trunk = {
+        "model.layers.0.attn_hyper_connection.input_mix_weight_down": mx.zeros((10, 10)),
+        "model.layers.0.attn_hyper_connection.input_mix_weight_up": mx.zeros((10, 10)),
+        "model.layers.0.attn_hyper_connection.block_inject_weight": mx.zeros((10, 10)),
+        "model.hyper_connection_mixer.input_mix_weight_down": mx.zeros((10, 10)),
+    }
+    sanitized = sanitize(raw_trunk)
+    assert "model.layers.0.attn_hyper_connection.input_mix_weight_down.weight" in sanitized
+    assert "model.layers.0.attn_hyper_connection.input_mix_weight_up.weight" in sanitized
+    assert "model.layers.0.attn_hyper_connection.block_inject_weight.weight" in sanitized
+    assert "model.hyper_connection_mixer.input_mix_weight_down.weight" in sanitized
+    assert "model.layers.0.attn_hyper_connection.input_mix_weight_down" not in sanitized
+
+    raw_mtp = {
+        "mtp.layers.0.attn_hyper_connection.input_mix_weight_down": mx.zeros((10, 10)),
+        "mtp.layers.0.attn_hyper_connection.input_mix_weight_up": mx.zeros((10, 10)),
+        "mtp.layers.0.attn_hyper_connection.block_inject_weight": mx.zeros((10, 10)),
+        "mtp.hyper_connection_mixer.input_mix_weight_down": mx.zeros((10, 10)),
+    }
+    processed = _process_raw_mtp_weights(raw_mtp, is_mlx_format=True)
+    assert "layers.0.attn_hyper_connection.input_mix_weight_down.weight" in processed
+    assert "layers.0.attn_hyper_connection.input_mix_weight_up.weight" in processed
+    assert "layers.0.attn_hyper_connection.block_inject_weight.weight" in processed
+    assert "hyper_connection_mixer.input_mix_weight_down.weight" in processed
+
+
+def test_rebuild_exact_mtp_cells_restores_and_replays_target_hiddens():
+    from unittest.mock import MagicMock
+    from mtplx.qwen4_exp_mtp_patch import _rebuild_exact_mtp_cells
+
+    mock_snap = MagicMock()
+    mock_model = MagicMock()
+    mock_model.mtp_forward.return_value = (mx.zeros((1, 1, 10)), mx.zeros((1, 1, 10)))
+
+    mtp_cache = [MagicMock()]
+    mtp_snaps = [mock_snap]
+    step_hiddens = [mx.zeros((1, 1, 32)), mx.zeros((1, 1, 32))]
+    accepted = [101, 102]
+
+    _rebuild_exact_mtp_cells(mock_model, mtp_cache, mtp_snaps, step_hiddens, accepted)
+    mock_snap.restore.assert_called_once_with(mtp_cache)
+    assert mock_model.mtp_forward.call_count == 2
+
+
+
 
 
 

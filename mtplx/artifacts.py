@@ -348,11 +348,20 @@ def text_config(config: dict[str, Any]) -> dict[str, Any]:
 
 def expected_mtp_file(model_dir: Path | str, config: dict[str, Any] | None = None) -> Path:
     model_path = Path(model_dir)
-    config = config if config is not None else load_config(model_path)
-    extra = config.get("mlx_lm_extra_tensors", {})
+    if config is None:
+        try:
+            config = load_config(model_path)
+        except Exception:
+            config = {}
+    extra = config.get("mlx_lm_extra_tensors", {}) if isinstance(config, dict) else {}
     if isinstance(extra, dict) and extra.get("mtp_file"):
         return model_path / str(extra["mtp_file"])
-    for rel in ("mtp.safetensors", "mtp/weights.safetensors", "model-mtp.safetensors"):
+    for rel in (
+        "mtp.safetensors",
+        "mtp/weights.safetensors",
+        "model-mtp.safetensors",
+        "model-mtp-head.safetensors",
+    ):
         candidate = model_path / rel
         if candidate.exists():
             return candidate
@@ -377,7 +386,11 @@ def mtp_weights_present_on_disk(
     unchanged and a real detection bug on an MTP-bearing model still surfaces.
     """
     model_path = Path(model_dir)
-    config = config if config is not None else load_config(model_path)
+    if config is None:
+        try:
+            config = load_config(model_path)
+        except Exception:
+            config = {}
 
     # 1. Explicit MTP sidecar file (Qwen/GLM/hy3 external draft head).
     if expected_mtp_file(model_path, config).exists():

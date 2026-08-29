@@ -2293,6 +2293,13 @@ def _rewrite_packed_experts(weights: Dict[str, Any]) -> None:
                 break
 
 
+def _remap_hyper_connection_weights(weights: Dict[str, Any]) -> None:
+    for k in list(weights.keys()):
+        for suffix in ("input_mix_weight_down", "input_mix_weight_up", "block_inject_weight"):
+            if k == suffix or k.endswith("." + suffix):
+                weights[f"{k}.weight"] = weights.pop(k)
+
+
 def remap_fused_projections(weights: Dict[str, Any]) -> Dict[str, Any]:
     """Map old split GDN/MoE projection keys onto the fused module names.
 
@@ -2301,6 +2308,7 @@ def remap_fused_projections(weights: Dict[str, Any]) -> Dict[str, Any]:
     original groups (exact). Mixed-status pairs are not fused.
     """
     out = dict(weights)
+    _remap_hyper_connection_weights(out)
     _rewrite_packed_experts(out)
 
     qkv_stems = [
