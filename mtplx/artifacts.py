@@ -253,6 +253,20 @@ def _mtp_expected_key_set(
         return expand_mtp_layer_keys(base, n_layers)
 
     if _is_qwen4_exp_config(config):
+        has_prequantized_aux = any(
+            key.endswith(".scales") or key.endswith(".biases")
+            for key in normalized
+        )
+        if prequantized or has_prequantized_aux:
+            expected = _expected_prequantized_keys_for_present_aux(
+                _expanded(EXPECTED_QWEN4_EXP_MTP_KEYS),
+                normalized,
+            )
+            return (
+                expected,
+                len(expected),
+                "prequantized-mlx-affine-qwen4-exp",
+            )
         expected = _expanded(EXPECTED_QWEN4_EXP_MTP_KEYS)
         return (
             expected,

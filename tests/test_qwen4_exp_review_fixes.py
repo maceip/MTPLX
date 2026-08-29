@@ -2989,6 +2989,115 @@ def test_qwen4_exp_recurrent_cache_filter_rebases_padding():
     assert list(cache.left_padding.tolist()) == [0, 2]
 
 
+def test_qsa_indexer_rebases_positions_with_cache_padding():
+    from mtplx.models.qwen4_exp import QSAIndexer, TextArgs
+
+    args = TextArgs(
+        hidden_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        indexer_n_heads=2,
+        indexer_kv_heads=1,
+        indexer_head_dim=16,
+        indexer_budget=8,
+        indexer_compress_ratio=4,
+    )
+    indexer = QSAIndexer(args)
+
+    # Row 0: no padding (left_padding=0), logical offset=8, physical pos=8
+    # Row 1: left_padding=4, logical offset=4, physical pos=8
+    B, S, H, D = 2, 1, 2, 16
+    q = mx.ones((B, S, H, D))
+    # q_pos contains logical positions: row 0 is 8, row 1 is 4
+    q_pos = mx.array([[8], [4]], dtype=mx.int32)
+    left_padding = mx.array([0, 4], dtype=mx.int32)
+    kv_len = 9  # Physical cache has 9 tokens (0..8)
+    n_blocks = kv_len // 4  # 2 blocks: 0..3 and 4..7
+    pooled = mx.ones((B, n_blocks, D))
+
+    sel = indexer.select(q, q_pos, pooled, kv_len, left_padding=left_padding)
+    assert sel is not None
+    # For row 1: physical pos is 4+4=8. Tail start should be block 2 (starts at 8).
+    # Token 8 should be valid and present in tail.
+    assert 8 in sel.token_idx[1, 0].tolist()
+    # Find position of token 8 in token_idx
+    idx_list = sel.token_idx[1, 0].tolist()
+    valid_list = sel.valid[1, 0].tolist()
+    pos_8 = idx_list.index(8)
+    assert valid_list[pos_8] is True
+
+
+def test_mtp_expected_key_set_accepts_prequantized_qwen4_exp_inventory():
+    from mtplx.artifacts import _mtp_expected_key_set
+    from mtplx.constants import EXPECTED_QWEN4_EXP_MTP_KEYS
+
+    config = {
+        "model_type": "qwen4_exp",
+        "mtp_num_hidden_layers": 1,
+        "mtplx_mtp_quantization": {"prequantized": True},
+    }
+
+    # Case 1: Prequantized config with observed aux leaves
+    observed_keys = tuple(
+        list(EXPECTED_QWEN4_EXP_MTP_KEYS)
+        + [
+            "mtp.layers.0.mlp.switch_mlp.down_proj.scales",
+            "mtp.layers.0.mlp.switch_mlp.down_proj.biases",
+        ]
+    )
+    expected, count, sidecar_format = _mtp_expected_key_set(config, keys=observed_keys)
+    assert sidecar_format == "prequantized-mlx-affine-qwen4-exp"
+    assert "mtp.layers.0.mlp.switch_mlp.down_proj.scales" in expected
+    assert "mtp.layers.0.mlp.switch_mlp.down_proj.biases" in expected
+    assert count == len(EXPECTED_QWEN4_EXP_MTP_KEYS) + 2
+
+    # Case 2: BF16 config and keys
+    bf16_config = {"model_type": "qwen4_exp", "mtp_num_hidden_layers": 1}
+    expected_bf16, count_bf16, format_bf16 = _mtp_expected_key_set(
+        bf16_config, keys=EXPECTED_QWEN4_EXP_MTP_KEYS
+    )
+    assert format_bf16 == "bf16-qwen4-exp"
+    assert count_bf16 == len(EXPECTED_QWEN4_EXP_MTP_KEYS)
+
+
+def test_attn_cache_state_handles_vector_offset_and_snapshot_cache():
+    from mtplx.cache_state import snapshot_cache
+    from mtplx.models.qwen4_exp import _AttnCache
+
+    cache = _AttnCache()
+    cache.keys = mx.ones((2, 2, 16, 32))
+    cache.values = mx.ones((2, 2, 16, 32))
+    cache.offset = mx.array([8, 4], dtype=mx.int32)
+    cache.left_padding = mx.array([0, 4], dtype=mx.int32)
+    cache._idx = 8
+    cache.indexer.update(mx.ones((2, 8, 32)))
+
+    # Reading state on vector offset should not crash with ambiguity error
+    st = cache.state
+    assert len(st) == 5
+    k, v, off, lp, indexer_k = st
+    assert k.shape == (2, 2, 8, 32)
+    assert v.shape == (2, 2, 8, 32)
+    assert list(off.tolist()) == [8, 4]
+    assert list(lp.tolist()) == [0, 4]
+
+    # Test snapshot_cache on merged cache
+    snap = snapshot_cache([cache])
+    assert len(snap.states) == 1
+    snap_st = snap.states[0]
+    assert len(snap_st) == 5
+
+    # Test restoring state
+    fresh_cache = _AttnCache()
+    fresh_cache.state = snap_st
+    assert fresh_cache.keys.shape == (2, 2, 8, 32)
+    assert list(fresh_cache.offset.tolist()) == [8, 4]
+    assert list(fresh_cache.left_padding.tolist()) == [0, 4]
+    assert fresh_cache._idx == 8
+
+
 
 
 

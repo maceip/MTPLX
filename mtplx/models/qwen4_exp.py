@@ -690,19 +690,21 @@ class QSAIndexer(nn.Module):
         B, S, _, _ = q.shape
         n_blocks = int(pooled.shape[1])
         r = self.compress_ratio
-        if q_pos.ndim == 2:
-            n_complete = (q_pos + 1) // r
-            is_complete = mx.arange(n_blocks)[None, None, :] < n_complete[:, :, None]
+
+        if left_padding is not None:
+            phys_q_pos = (q_pos[None, :] if q_pos.ndim == 1 else q_pos) + left_padding[:, None]
         else:
-            n_complete = (q_pos + 1) // r
-            is_complete = (mx.arange(n_blocks)[None, :] < n_complete[:, None])[None, :, :]
+            phys_q_pos = mx.broadcast_to(q_pos[None, :] if q_pos.ndim == 1 else q_pos, (B, S))
+
+        n_complete = (phys_q_pos + 1) // r
+        is_complete = mx.arange(n_blocks)[None, None, :] < n_complete[:, :, None]
 
         if left_padding is not None:
             block_ends = (mx.arange(n_blocks) + 1) * r  # (n_blocks,)
             is_not_pad = block_ends[None, None, :] > left_padding[:, None, None]  # (B, 1, n_blocks)
             valid_block = is_complete & is_not_pad  # (B, S, n_blocks)
         else:
-            valid_block = mx.broadcast_to(is_complete, (B, S, n_blocks))
+            valid_block = is_complete
 
         # Sum_h ReLU(<q_h, k_b>) without materializing the 4-head score tensor.
         acc = None
@@ -726,16 +728,9 @@ class QSAIndexer(nn.Module):
         if left_padding is not None:
             valid_blk = valid_blk & (tok >= left_padding[:, None, None])
 
-        if q_pos.ndim == 2:
-            tail_start = n_complete * r
-            tail = tail_start[:, :, None] + mx.arange(r)
-            tail_valid = (tail <= q_pos[:, :, None]) & (tail < kv_len)
-        else:
-            tail_start = n_complete * r
-            tail = tail_start[:, None] + mx.arange(r)  # (S, r)
-            tail_valid = (tail <= q_pos[:, None]) & (tail < kv_len)
-            tail = mx.broadcast_to(tail[None], (B, S, r))
-            tail_valid = mx.broadcast_to(tail_valid[None], (B, S, r))
+        tail_start = n_complete * r
+        tail = tail_start[:, :, None] + mx.arange(r)
+        tail_valid = (tail <= phys_q_pos[:, :, None]) & (tail < kv_len)
         if left_padding is not None:
             tail_valid = tail_valid & (tail >= left_padding[:, None, None])
 
@@ -2275,11 +2270,29 @@ class _AttnCache(KVCache):
         indexer_keys = getattr(self.indexer, "keys", None)
         if self.keys is None or self.values is None:
             return self.keys, self.values, indexer_keys
-        if self.offset == self.keys.shape[2]:
+        if isinstance(getattr(self, "offset", None), mx.array):
+            active_len = (
+                self._idx
+                if (hasattr(self, "_idx") and self._idx is not None)
+                else int(self.keys.shape[2])
+            )
+            k = (
+                self.keys
+                if active_len >= self.keys.shape[2]
+                else self.keys[..., :active_len, :]
+            )
+            v = (
+                self.values
+                if active_len >= self.values.shape[2]
+                else self.values[..., :active_len, :]
+            )
+            return k, v, self.offset, self.left_padding, indexer_keys
+        off = int(self.offset)
+        if off == self.keys.shape[2]:
             return self.keys, self.values, indexer_keys
         return (
-            self.keys[..., : self.offset, :],
-            self.values[..., : self.offset, :],
+            self.keys[..., :off, :],
+            self.values[..., :off, :],
             indexer_keys,
         )
 
@@ -2288,15 +2301,41 @@ class _AttnCache(KVCache):
         if v is None:
             self.keys = self.values = None
             self.offset = 0
+            self.left_padding = None
+            self._idx = 0
             if hasattr(self, "indexer") and self.indexer is not None:
                 self.indexer.keys = None
                 self.indexer._len = 0
+                self.indexer.left_padding = None
             return
-        if len(v) == 3:
+        if len(v) == 5:
+            keys, values, offset, left_padding, indexer_keys = v
+            self.keys = keys
+            self.values = values
+            self.offset = offset
+            self.left_padding = left_padding
+            self._idx = 0 if self.keys is None else int(self.keys.shape[2])
+            if hasattr(self, "indexer") and self.indexer is not None:
+                self.indexer.keys = indexer_keys
+                self.indexer._len = (
+                    0 if indexer_keys is None else int(indexer_keys.shape[1])
+                )
+                self.indexer.left_padding = left_padding
+        elif len(v) == 4:
+            keys, values, offset, left_padding = v
+            self.keys = keys
+            self.values = values
+            self.offset = offset
+            self.left_padding = left_padding
+            self._idx = 0 if self.keys is None else int(self.keys.shape[2])
+            if hasattr(self, "indexer") and self.indexer is not None:
+                self.indexer.left_padding = left_padding
+        elif len(v) == 3:
             keys, values, indexer_keys = v
             self.keys = keys
             self.values = values
             self.offset = 0 if self.keys is None else int(self.keys.shape[2])
+            self._idx = self.offset
             if hasattr(self, "indexer") and self.indexer is not None:
                 self.indexer.keys = indexer_keys
                 self.indexer._len = (
@@ -2307,6 +2346,7 @@ class _AttnCache(KVCache):
             self.keys = keys
             self.values = values
             self.offset = 0 if self.keys is None else int(self.keys.shape[2])
+            self._idx = self.offset
 
 
 # ---------------------------------------------------------------------------
