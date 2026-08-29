@@ -6280,7 +6280,12 @@ def generate_ar(
             # both the greedy and sampled branches draw from the constrained
             # distribution (-inf survives temperature/top-p/penalties).
             logits_row = constraint.mask_logits_row(logits_row)
-        sample_started = time.perf_counter()
+        if not _ar_sync_eval and step > _classic_start:
+            sync_started = time.perf_counter()
+            _eval(logits_row)
+            sync_elapsed = time.perf_counter() - sync_started
+            target_eval_time += sync_elapsed
+            target_decode_time += sync_elapsed
         token, _ = _sample_from_logits(
             logits_row,
             sampler,
@@ -6290,10 +6295,6 @@ def generate_ar(
             else None,
             penalty_overlay=(_ar_steer_overlay(tokens) if _steer_active else None),
         )
-        sample_elapsed = time.perf_counter() - sample_started
-        if not _ar_sync_eval and step > _classic_start:
-            target_eval_time += sample_elapsed
-            target_decode_time += sample_elapsed
         tokens.append(token)
         emit_token(token)
         events.append({"step": step, "token": token})
