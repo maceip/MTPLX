@@ -3211,6 +3211,46 @@ def test_mtp_weights_present_on_disk_unindexed_trunk_without_mtp_returns_false(t
     assert mtp_weights_present_on_disk(tmp_path, config) is True
 
 
+def test_loaded_weights_bytes_resolves_cached_and_remote_hf_refs(monkeypatch, tmp_path):
+    from mtplx.server.openai import _loaded_weights_bytes_for_model_path
+    from types import SimpleNamespace
+
+    # 1. Test resolving via cached_model_path / resolve_model_path
+    cached_dir = tmp_path / "cached_model"
+    cached_dir.mkdir()
+    (cached_dir / "model.safetensors").write_bytes(b"a" * 4000)
+    monkeypatch.setattr("mtplx.hf_loader.cached_model_path", lambda repo_id: cached_dir)
+
+    assert _loaded_weights_bytes_for_model_path("Qwen/Qwen4-Exp-72B-4bit") == 4000
+
+    # 2. Test deriving from remote HfApi inspection when not cached locally
+    non_existent = tmp_path / "non_existent"
+    monkeypatch.setattr("mtplx.hf_loader.cached_model_path", lambda repo_id: non_existent)
+    monkeypatch.setattr("mtplx.hf_loader.resolve_model_path", lambda repo_id: non_existent)
+
+    fake_siblings = [
+        SimpleNamespace(rfilename="model-00001-of-00002.safetensors", size=3000),
+        SimpleNamespace(rfilename="model-00002-of-00002.safetensors", size=5000),
+        SimpleNamespace(rfilename="mtp.safetensors", size=1000),
+        SimpleNamespace(rfilename="adapter_model.safetensors", size=9000),  # should be excluded
+        SimpleNamespace(rfilename="tokenizer.json", size=500),  # non-safetensors excluded
+    ]
+    fake_info = SimpleNamespace(siblings=fake_siblings)
+
+    class FakeHfApi:
+        def model_info(self, repo_id, files_metadata=True):
+            return fake_info
+
+    monkeypatch.setattr("huggingface_hub.HfApi", FakeHfApi)
+    monkeypatch.setattr(
+        "mtplx.artifacts._hf_download_json",
+        lambda repo_id, filename: (None, None, "not found"),
+    )
+
+    # 3000 + 5000 + 1000 = 9000 bytes
+    assert _loaded_weights_bytes_for_model_path("Qwen/Qwen4-Exp-72B-4bit") == 9000
+
+
 
 
 

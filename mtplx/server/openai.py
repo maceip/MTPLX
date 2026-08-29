@@ -1679,9 +1679,79 @@ def _loaded_weights_bytes_for_model_path(model_path: str | Path | None) -> int |
     if not model_path:
         return None
     try:
-        root = Path(str(model_path))
+        model_str = str(model_path).strip()
+        root = Path(model_str)
         if not root.is_dir():
-            return None
+            resolved_local: Path | None = None
+            try:
+                from mtplx.hf_loader import cached_model_path, repo_id_from_model_ref, resolve_model_path
+
+                repo_id = repo_id_from_model_ref(model_str)
+                if repo_id:
+                    try:
+                        resolved_local = resolve_model_path(model_str)
+                    except Exception:
+                        pass
+                    if not resolved_local or not resolved_local.is_dir():
+                        cached = cached_model_path(repo_id)
+                        if cached.is_dir():
+                            resolved_local = cached
+                    if not resolved_local or not resolved_local.is_dir():
+                        try:
+                            from huggingface_hub import try_to_load_from_cache
+
+                            cfg_path = try_to_load_from_cache(repo_id, "config.json")
+                            if isinstance(cfg_path, str) and Path(cfg_path).is_file():
+                                snap_dir = Path(cfg_path).parent
+                                if snap_dir.is_dir():
+                                    resolved_local = snap_dir
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+            if resolved_local and resolved_local.is_dir():
+                root = resolved_local
+            else:
+                try:
+                    from mtplx.artifacts import _hf_download_json, _hf_repo_id_from_ref
+                    from mtplx.backends.registry import _is_mtp_sidecar_file, _is_trunk_safetensors
+
+                    repo_id = _hf_repo_id_from_ref(model_str)
+                    if repo_id:
+                        from huggingface_hub import HfApi
+
+                        info = HfApi().model_info(repo_id, files_metadata=True)
+                        siblings = getattr(info, "siblings", None) or []
+
+                        index_data, _, _ = _hf_download_json(repo_id, "model.safetensors.index.json")
+                        weight_map = index_data.get("weight_map", {}) if isinstance(index_data, dict) else {}
+                        wanted_shards = (
+                            set(weight_map.values())
+                            if isinstance(weight_map, dict) and weight_map
+                            else set()
+                        )
+
+                        total_remote = 0
+                        has_shards = False
+                        for s in siblings:
+                            rfilename = getattr(s, "rfilename", "") or ""
+                            size = getattr(s, "size", None)
+                            if size and isinstance(size, int) and size > 0:
+                                p = Path(rfilename)
+                                if wanted_shards:
+                                    if rfilename in wanted_shards or _is_mtp_sidecar_file(p):
+                                        total_remote += size
+                                        has_shards = True
+                                else:
+                                    if _is_trunk_safetensors(p) or _is_mtp_sidecar_file(p):
+                                        total_remote += size
+                                        has_shards = True
+                        if has_shards and total_remote > 0:
+                            return total_remote
+                except Exception:
+                    pass
+                return None
 
         trunk_shards: set[Path] = set()
         sidecar_shards: set[Path] = set()
