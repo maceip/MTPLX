@@ -6230,6 +6230,17 @@ def generate_ar(
         finally:
             _lane_mode_off(False)
 
+    # Double-buffered decode (mlx-lm pattern): dispatch step t+1's forward
+    # without blocking and let the next sample's materialization be the only
+    # block point, so host bookkeeping overlaps GPU execution. MTPLX_SYNC_AR=1
+    # restores the historical blocking eval.
+    _ar_sync_eval = str(os.environ.get("MTPLX_SYNC_AR", "")).strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    ) or bool(os.environ.get("MTPLX_EVAL_AUDIT"))
+
     _classic_start = max_tokens if _lane_finished else _lane_committed
     for step in range(_classic_start, max_tokens):
         if _loop_guard is not None:
@@ -6323,10 +6334,17 @@ def generate_ar(
             hidden_next = None
         forward_graph_elapsed = time.perf_counter() - started
         eval_started = time.perf_counter()
-        if hidden_next is None:
-            _eval(logits_next)
+        if _ar_sync_eval:
+            if hidden_next is None:
+                _eval(logits_next)
+            else:
+                _eval(logits_next, hidden_next)
         else:
-            _eval(logits_next, hidden_next)
+            if hidden_next is None:
+                mx.async_eval(logits_next)
+            else:
+                mx.async_eval(logits_next, hidden_next)
+            _owner_progress_tick()
         eval_elapsed = time.perf_counter() - eval_started
         elapsed_decode = time.perf_counter() - started
         target_decode_time += elapsed_decode
