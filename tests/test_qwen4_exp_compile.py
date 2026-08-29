@@ -36,6 +36,7 @@ def test_qwen4_exp_compile_kill_switch_precedence(monkeypatch):
     model = _make_dummy_model()
     text_model = model.language_model.model
     assert text_model._gdn_compiled_env is False
+    assert text_model._gdn_compile_explicit_off is True
 
     # When MTPLX_QWEN4EXP_COMPILE=0, compilation must be disabled even if MTPLX_COMPILED_GDN=1
     monkeypatch.setenv("MTPLX_COMPILED_GDN", "1")
@@ -43,3 +44,13 @@ def test_qwen4_exp_compile_kill_switch_precedence(monkeypatch):
     model2 = _make_dummy_model()
     text_model2 = model2.language_model.model
     assert text_model2._gdn_compiled_env is False
+    assert text_model2._gdn_compile_explicit_off is True
+
+
+def test_qwen4_exp_compile_kill_switch_overrides_pipeline_lane(monkeypatch):
+    """Verify that explicit compile-off overrides set_ar_pipeline_mode."""
+    monkeypatch.setenv("MTPLX_COMPILED_GDN", "0")
+    model = _make_dummy_model()
+    model.set_ar_pipeline_mode(True)
+    text_model = model.language_model.model
+    assert text_model._gdn_compiled_lane is False

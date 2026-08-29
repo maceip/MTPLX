@@ -2241,9 +2241,11 @@ class Qwen4ExpTextModel(nn.Module):
         qwen4_env = os.environ.get("MTPLX_QWEN4EXP_COMPILE")
         falsy_env = {"0", "false", "no", "off"}
         truthy_env = {"1", "true", "yes", "on"}
-        if (gdn_env is not None and gdn_env.strip().lower() in falsy_env) or (
-            qwen4_env is not None and qwen4_env.strip().lower() in falsy_env
-        ):
+        self._gdn_compile_explicit_off = (
+            (gdn_env is not None and gdn_env.strip().lower() in falsy_env)
+            or (qwen4_env is not None and qwen4_env.strip().lower() in falsy_env)
+        )
+        if self._gdn_compile_explicit_off:
             self._gdn_compiled_env = False
         else:
             self._gdn_compiled_env = (
@@ -2272,6 +2274,7 @@ class Qwen4ExpTextModel(nn.Module):
             # widths. Prefill and masked/padded forwards stay eager.
             1 <= h.shape[1] <= 4
             and ssm_mask is None
+            and not self._gdn_compile_explicit_off
             and (self._gdn_compiled_env or self._gdn_compiled_lane)
             and cache[self.ssm_idx] is not None
         ):
@@ -2846,7 +2849,11 @@ class Model(nn.Module):
             emb._stage_disabled = bool(enabled)
             table.prefer_lazy = bool(enabled)
         if ready:
-            self.language_model.model._gdn_compiled_lane = bool(enabled)
+            model = self.language_model.model
+            if not getattr(model, "_gdn_compile_explicit_off", False):
+                model._gdn_compiled_lane = bool(enabled)
+            else:
+                model._gdn_compiled_lane = False
         return ready
 
     # -- family capture-commit (repair-free verify rollback) ----------------
