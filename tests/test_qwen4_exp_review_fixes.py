@@ -1737,13 +1737,13 @@ def test_attn_cache_filters_left_padding_and_lengths():
 
     # Extract
     c1_ext = c1.extract(0)
-    assert c1_ext.left_padding.shape[0] == 1
-    assert int(c1_ext.left_padding[0].item()) == 2
+    assert c1_ext.keys.shape == (1, 2, 6, 32)
+    assert c1_ext.offset == 6
+    assert c1_ext.left_padding is None
 
     # Extend
     c1_ext.extend(c2)
     assert c1_ext.left_padding.shape[0] == 2
-    assert list(c1_ext.left_padding.tolist()) == [2, 4]
 
 
 def test_metal_memory_caps_and_headroom_scale_with_small_models(monkeypatch, tmp_path):
@@ -2650,17 +2650,26 @@ def test_attn_cache_extract_slices_to_active_offset():
     from mtplx.models.qwen4_exp import _AttnCache
 
     c = _AttnCache()
-    # Allocated buffer has 256 slots, but offset is only 16
+    # Allocated buffer has 256 slots, active _idx is 16
     c.keys = mx.ones((2, 2, 256, 32))
     c.values = mx.ones((2, 2, 256, 32))
     c.offset = 16
+    c._idx = 16
     c.left_padding = mx.array([2, 4])
 
-    extracted = c.extract(0)
-    assert extracted.keys.shape == (1, 2, 16, 32)
-    assert extracted.values.shape == (1, 2, 16, 32)
-    assert extracted.offset == 16
-    assert int(extracted.left_padding[0].item()) == 2
+    extracted0 = c.extract(0)
+    # Row 0 padding is 2 -> slices 2:16, length 14
+    assert extracted0.keys.shape == (1, 2, 14, 32)
+    assert extracted0.values.shape == (1, 2, 14, 32)
+    assert extracted0.offset == 14
+    assert extracted0.left_padding is None
+
+    extracted1 = c.extract(1)
+    # Row 1 padding is 4 -> slices 4:16, length 12
+    assert extracted1.keys.shape == (1, 2, 12, 32)
+    assert extracted1.values.shape == (1, 2, 12, 32)
+    assert extracted1.offset == 12
+    assert extracted1.left_padding is None
 
 
 def test_attn_cache_and_indexer_extend_aligns_differing_histories_and_paddings():
@@ -3096,6 +3105,110 @@ def test_attn_cache_state_handles_vector_offset_and_snapshot_cache():
     assert list(fresh_cache.offset.tolist()) == [8, 4]
     assert list(fresh_cache.left_padding.tolist()) == [0, 4]
     assert fresh_cache._idx == 8
+
+
+def test_ple_context_handles_vector_offset_in_batch():
+    from mtplx.models.qwen4_exp import _build_ple_tail_context
+
+    B, S, ctx_len = 2, 1, 4
+    prev_ctx = mx.ones((B, ctx_len), dtype=mx.int32)
+    ids = mx.array([[10], [20]], dtype=mx.int32)
+    eos = 0
+    left_padding = mx.array([0, 2], dtype=mx.int32)
+    vector_offset = mx.array([8, 4], dtype=mx.int32)
+    conv_mask = mx.array([[True], [True]])
+
+    # Should not raise TypeError/ValueError when offset is a vector
+    tail = _build_ple_tail_context(
+        prev_ctx,
+        ids,
+        ctx_len,
+        eos,
+        left_padding=left_padding,
+        offset=vector_offset,
+        mask=conv_mask,
+    )
+    assert tail.shape == (2, ctx_len)
+
+
+def test_qwen4_mtp_key_set_normalizes_aliases():
+    from mtplx.artifacts import _inspect_mtp_tensors_from_keys
+
+    config = {
+        "model_type": "qwen4_exp",
+        "mtp_num_hidden_layers": 1,
+    }
+
+    # Raw unnormalized aliases
+    raw_keys = (
+        "mtp.eh_proj.weight",
+        "mtp.hyper_connection_mixer.hc_norm.weight",
+        "mtp.hyper_connection_mixer.input_mix_weight_down.weight",
+        "mtp.hyper_connection_mixer.input_mix_weight_up.weight",
+        "mtp.layers.0.attn_hyper_connection.block_inject_weight.weight",
+        "mtp.layers.0.attn_hyper_connection.hc_norm.weight",
+        "mtp.layers.0.attn_hyper_connection.input_mix_weight_down.weight",
+        "mtp.layers.0.attn_hyper_connection.input_mix_weight_up.weight",
+        "mtp.layers.0.mlp.gate.weight",
+        "mtp.layers.0.mlp.shared_expert.down_proj.weight",
+        "mtp.layers.0.mlp.shared_expert.gate_proj.weight",
+        "mtp.layers.0.mlp.shared_expert.up_proj.weight",
+        "mtp.layers.0.mlp.shared_expert_gate.weight",
+        "mtp.layers.0.mlp.experts.down_proj.weight",
+        "mtp.layers.0.mlp.experts.gate_up_proj.weight",
+        "mtp.layers.0.mlp_hyper_connection.block_inject_weight.weight",
+        "mtp.layers.0.mlp_hyper_connection.hc_norm.weight",
+        "mtp.layers.0.mlp_hyper_connection.input_mix_weight_down.weight",
+        "mtp.layers.0.mlp_hyper_connection.input_mix_weight_up.weight",
+        "mtp.layers.0.self_attn.k_layernorm.weight",
+        "mtp.layers.0.self_attn.k_proj.weight",
+        "mtp.layers.0.self_attn.o_proj.weight",
+        "mtp.layers.0.self_attn.q_layernorm.weight",
+        "mtp.layers.0.self_attn.q_proj.weight",
+        "mtp.layers.0.self_attn.v_proj.weight",
+        "mtp.enorm.weight",
+        "mtp.hnorm.weight",
+    )
+
+    inspection = _inspect_mtp_tensors_from_keys(
+        "mtp.safetensors",
+        config=config,
+        exists=True,
+        keys=raw_keys,
+    )
+    assert len(inspection.missing_expected_keys) == 0
+    assert len(inspection.extra_keys) == 0
+
+
+def test_mtp_weights_present_on_disk_unindexed_trunk_without_mtp_returns_false(tmp_path):
+    from mtplx.artifacts import mtp_weights_present_on_disk
+    import mlx.core as mx
+
+    # Write a direct unindexed model.safetensors with only trunk keys
+    trunk_path = tmp_path / "model.safetensors"
+    mx.save_safetensors(
+        str(trunk_path),
+        {"model.embed_tokens.weight": mx.zeros((16, 16))},
+    )
+
+    config = {
+        "model_type": "qwen4_exp",
+        "num_hidden_layers": 4,
+        "mtp_num_hidden_layers": 1,
+    }
+
+    # Should return False so loader takes AR fallback instead of raising
+    assert mtp_weights_present_on_disk(tmp_path, config) is False
+
+    # If MTP key is present in unindexed trunk -> returns True
+    mx.save_safetensors(
+        str(trunk_path),
+        {
+            "model.embed_tokens.weight": mx.zeros((16, 16)),
+            "mtp.fc_embedding.weight": mx.zeros((16, 16)),
+        },
+    )
+    assert mtp_weights_present_on_disk(tmp_path, config) is True
 
 
 

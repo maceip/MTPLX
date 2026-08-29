@@ -219,6 +219,64 @@ def _expected_prequantized_keys_for_present_aux(
     return expected
 
 
+def _normalize_qwen4_mtp_key_set(keys: set[str]) -> set[str]:
+    out = set()
+    for k in keys:
+        norm = normalize_mtp_key(k)
+        if norm.endswith(".enorm.weight"):
+            norm = norm[:-len(".enorm.weight")] + ".pre_fc_norm_embedding.weight"
+        elif norm.endswith(".hnorm.weight"):
+            norm = norm[:-len(".hnorm.weight")] + ".pre_fc_norm_hidden.weight"
+
+        for suffix in ("input_mix_weight_down", "input_mix_weight_up", "block_inject_weight"):
+            if norm.endswith("." + suffix + ".weight"):
+                norm = norm[:-len(".weight")]
+
+        if ".self_attn.q_layernorm." in norm:
+            norm = norm.replace(".self_attn.q_layernorm.", ".self_attn.q_norm.")
+        if ".self_attn.k_layernorm." in norm:
+            norm = norm.replace(".self_attn.k_layernorm.", ".self_attn.k_norm.")
+
+        if norm in {"mtp.eh_proj.weight", "mtp.fc.weight"}:
+            out.add("mtp.fc_embedding.weight")
+            out.add("mtp.fc_hidden.weight")
+            continue
+        if ".eh_proj." in norm or ".fc." in norm:
+            for name in (".eh_proj.", ".fc."):
+                if name in norm:
+                    prefix, suffix = norm.split(name, 1)
+                    out.add(f"{prefix}.fc_embedding.{suffix}")
+                    out.add(f"{prefix}.fc_hidden.{suffix}")
+                    break
+            continue
+
+        if ".mlp.experts.gate_up_proj." in norm:
+            prefix, suffix = norm.split(".mlp.experts.gate_up_proj.", 1)
+            out.add(f"{prefix}.mlp.switch_mlp.gate_proj.{suffix}")
+            out.add(f"{prefix}.mlp.switch_mlp.up_proj.{suffix}")
+            continue
+        if ".mlp.switch_mlp.gate_up_proj." in norm:
+            prefix, suffix = norm.split(".mlp.switch_mlp.gate_up_proj.", 1)
+            out.add(f"{prefix}.mlp.switch_mlp.gate_proj.{suffix}")
+            out.add(f"{prefix}.mlp.switch_mlp.up_proj.{suffix}")
+            continue
+        if ".mlp.experts.down_proj." in norm:
+            prefix, suffix = norm.split(".mlp.experts.down_proj.", 1)
+            out.add(f"{prefix}.mlp.switch_mlp.down_proj.{suffix}")
+            continue
+        if ".mlp.experts.gate_proj." in norm:
+            prefix, suffix = norm.split(".mlp.experts.gate_proj.", 1)
+            out.add(f"{prefix}.mlp.switch_mlp.gate_proj.{suffix}")
+            continue
+        if ".mlp.experts.up_proj." in norm:
+            prefix, suffix = norm.split(".mlp.experts.up_proj.", 1)
+            out.add(f"{prefix}.mlp.switch_mlp.up_proj.{suffix}")
+            continue
+
+        out.add(norm)
+    return out
+
+
 def _is_qwen4_exp_config(config: dict[str, Any]) -> bool:
     tcfg = config.get("text_config", config) if isinstance(config, dict) else {}
     model_type = str(tcfg.get("model_type") or config.get("model_type") or "").lower()
@@ -253,6 +311,7 @@ def _mtp_expected_key_set(
         return expand_mtp_layer_keys(base, n_layers)
 
     if _is_qwen4_exp_config(config):
+        normalized = _normalize_qwen4_mtp_key_set(normalized)
         has_prequantized_aux = any(
             key.endswith(".scales") or key.endswith(".biases")
             for key in normalized
@@ -459,7 +518,39 @@ def mtp_weights_present_on_disk(
 
     index_path = model_path / "model.safetensors.index.json"
     if not index_path.exists():
-        # No index to inspect: cannot prove absence, preserve legacy behavior.
+        direct_shards = [
+            model_path / f
+            for f in ("model.safetensors", "weights.safetensors")
+            if (model_path / f).is_file()
+        ]
+        if not direct_shards:
+            direct_shards = [
+                p for p in model_path.glob("*.safetensors")
+                if p.is_file() and not p.name.startswith("adapter") and not p.name.startswith("optimizer")
+            ]
+        if direct_shards:
+            has_mtp = False
+            for shard in direct_shards:
+                tensors, err = _safetensors_header_tensor_infos(shard)
+                if err:
+                    return True  # If unreadable, conservative True
+                keys = [str(t.key) for t in tensors]
+                if any(is_mtp_key(k) for k in keys):
+                    has_mtp = True
+                    break
+                start = int(
+                    text_config(config).get("num_hidden_layers")
+                    or config.get("num_hidden_layers")
+                    or 0
+                )
+                count = _num_mtp_layers(config)
+                if start and count:
+                    wanted = tuple(f"model.layers.{start + i}." for i in range(count))
+                    if any(k.startswith(wanted) for k in keys):
+                        has_mtp = True
+                        break
+            return has_mtp
+        # No index to inspect and no direct shards: cannot prove absence, preserve legacy behavior.
         return True
     try:
         weight_map = json.loads(index_path.read_text(encoding="utf-8")).get(
@@ -667,6 +758,8 @@ def inspect_mtp_tensors(model_dir: Path | str, config: dict[str, Any] | None = N
         )
 
     key_set = {normalize_mtp_key(t.key) for t in tensors}
+    if _is_qwen4_exp_config(config or {}):
+        key_set = _normalize_qwen4_mtp_key_set(key_set)
     expected_keys, expected_count, sidecar_format = _mtp_expected_key_set(
         config or {},
         keys=tuple(key_set),
@@ -978,12 +1071,14 @@ def _inspect_mtp_tensors_from_keys(
     exists: bool,
     keys: tuple[str, ...] = (),
 ) -> MTPInspection:
-    normalized_keys = tuple(sorted(normalize_mtp_key(key) for key in keys))
+    key_set = {normalize_mtp_key(key) for key in keys}
+    if _is_qwen4_exp_config(config or {}):
+        key_set = _normalize_qwen4_mtp_key_set(key_set)
+    normalized_keys = tuple(sorted(key_set))
     expected_keys, expected_count, sidecar_format = _mtp_expected_key_set(
         config,
         keys=normalized_keys,
     )
-    key_set = set(normalized_keys)
     return MTPInspection(
         mtp_file=mtp_file,
         exists=exists,

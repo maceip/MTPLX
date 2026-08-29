@@ -1580,7 +1580,7 @@ def _build_ple_tail_context(
     ctx_len: int,
     eos: int,
     left_padding: Optional[Any] = None,
-    offset: int = 0,
+    offset: Any = 0,
     mask: Optional[Any] = None,
 ) -> mx.array:
     if left_padding is None and mask is None:
@@ -1611,7 +1611,8 @@ def _build_ple_tail_context(
     )
     for i in range(B):
         lp = int(lp_list[i]) if i < len(lp_list) else 0
-        start_idx = max(0, min(S, lp - int(offset)))
+        off_i = int(offset[i].item()) if isinstance(offset, mx.array) else int(offset)
+        start_idx = max(0, min(S, lp - off_i))
         valid_ids = ids[i : i + 1, start_idx:S]
         v_len = int(valid_ids.shape[1])
         if v_len >= ctx_len:
@@ -1724,9 +1725,9 @@ class Qwen4ExpModel(nn.Module):
             if pc is not None:
                 offset = 0
                 if attn_cache is not None and hasattr(attn_cache, "offset"):
-                    offset = int(getattr(attn_cache, "offset", 0))
+                    offset = getattr(attn_cache, "offset", 0)
                 elif linear_cache is not None and hasattr(linear_cache, "offset"):
-                    offset = int(getattr(linear_cache, "offset", 0))
+                    offset = getattr(linear_cache, "offset", 0)
                 tail = _build_ple_tail_context(
                     prev_ctx,
                     ids,
@@ -1897,11 +1898,12 @@ class _IndexerCache(_BaseCache):
 
     def extract(self, idx: int) -> "_IndexerCache":
         cache = _IndexerCache()
-        if self._buf is not None and self._len > 0:
-            k = self._buf[idx : idx + 1, : self._len, :]
+        lp = int(self.left_padding[idx].item()) if self.left_padding is not None else 0
+        end = self._len if self._len > 0 else (self._buf.shape[1] if self._buf is not None else 0)
+        if self._buf is not None and end > lp:
+            k = self._buf[idx : idx + 1, lp:end, :]
             cache.keys = mx.contiguous(k)
-        if self.left_padding is not None:
-            cache.left_padding = self.left_padding[idx : idx + 1]
+        cache.left_padding = None
         return cache
 
     @classmethod
@@ -2192,18 +2194,24 @@ class _AttnCache(KVCache):
 
     def extract(self, idx: int) -> "_AttnCache":
         cache = _AttnCache()
+        lp = int(self.left_padding[idx].item()) if getattr(self, "left_padding", None) is not None else 0
         if self.keys is not None:
-            off = (
-                int(self.offset[idx].item())
-                if isinstance(getattr(self, "offset", None), mx.array)
-                else int(getattr(self, "offset", self.keys.shape[2]))
+            end = (
+                self._idx
+                if (hasattr(self, "_idx") and self._idx is not None and self._idx > 0)
+                else int(self.keys.shape[2])
             )
-            off = min(off, self.keys.shape[2])
-            cache.keys = mx.contiguous(self.keys[idx : idx + 1, :, :off, :])
-            cache.values = mx.contiguous(self.values[idx : idx + 1, :, :off, :])
-            cache.offset = off
-        if getattr(self, "left_padding", None) is not None:
-            cache.left_padding = self.left_padding[idx : idx + 1]
+            end = min(end, self.keys.shape[2])
+            if end > lp:
+                cache.keys = mx.contiguous(self.keys[idx : idx + 1, :, lp:end, :])
+                cache.values = mx.contiguous(self.values[idx : idx + 1, :, lp:end, :])
+                cache.offset = int(cache.keys.shape[2])
+            else:
+                cache.keys = None
+                cache.values = None
+                cache.offset = 0
+            cache._idx = cache.offset
+        cache.left_padding = None
         if getattr(self, "lengths", None) is not None:
             cache.lengths = self.lengths[idx : idx + 1]
         if getattr(self, "_lengths", None) is not None:
