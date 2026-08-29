@@ -2237,10 +2237,20 @@ class Qwen4ExpTextModel(nn.Module):
             (i for i, t in enumerate(args.layer_types) if t != "linear_attention"),
             self.ssm_idx,
         )
-        self._gdn_compiled_env = (
-            os.environ.get("MTPLX_COMPILED_GDN", "0").strip().lower() in {"1", "true", "yes", "on"}
-            or os.environ.get("MTPLX_QWEN4EXP_COMPILE", "0").strip().lower() in {"1", "true", "yes", "on"}
-        )
+        gdn_env = os.environ.get("MTPLX_COMPILED_GDN")
+        qwen4_env = os.environ.get("MTPLX_QWEN4EXP_COMPILE")
+        falsy_env = {"0", "false", "no", "off"}
+        truthy_env = {"1", "true", "yes", "on"}
+        if (gdn_env is not None and gdn_env.strip().lower() in falsy_env) or (
+            qwen4_env is not None and qwen4_env.strip().lower() in falsy_env
+        ):
+            self._gdn_compiled_env = False
+        else:
+            self._gdn_compiled_env = (
+                gdn_env is not None and gdn_env.strip().lower() in truthy_env
+            ) or (
+                qwen4_env is not None and qwen4_env.strip().lower() in truthy_env
+            )
         self._gdn_compiled_lane = False
         self._decode_runs = None
         self._decode_run_fns = {}
