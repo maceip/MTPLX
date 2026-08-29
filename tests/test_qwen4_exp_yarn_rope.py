@@ -30,7 +30,7 @@ def test_qwen4_exp_yarn_rope_frequency_scaling():
 
 
 def test_qwen4_exp_yarn_rope_attention_factor_override():
-    """Verify explicit attention_factor or mscale in rope_parameters takes precedence."""
+    """Verify explicit attention_factor in rope_parameters takes precedence."""
     dim = 64
     base = 10_000_000.0
 
@@ -41,14 +41,6 @@ def test_qwen4_exp_yarn_rope_attention_factor_override():
     }
     _, mscale = _build_rope_inv_freq(dim, base, yarn_params_custom)
     assert mscale == 1.25
-
-    yarn_params_mscale = {
-        "rope_type": "yarn",
-        "factor": 4.0,
-        "mscale": 1.35,
-    }
-    _, mscale_alt = _build_rope_inv_freq(dim, base, yarn_params_mscale)
-    assert mscale_alt == 1.35
 
 
 def test_qwen4_exp_yarn_rope_fallback_max_position():

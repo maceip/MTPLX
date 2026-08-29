@@ -190,8 +190,6 @@ def _build_rope_inv_freq(
         inv_freq = 1.0 / periods
         if "attention_factor" in rp:
             mscale = float(rp["attention_factor"])
-        elif "mscale" in rp:
-            mscale = float(rp["mscale"])
         elif factor > 1:
             mscale = 0.1 * math.log(factor) + 1.0
     return inv_freq, mscale
