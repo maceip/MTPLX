@@ -402,7 +402,7 @@ def test_qwen4_exp_mtp_gate_requires_mtp_tensors(tmp_path):
     )
     assert _passes_qwen4_exp_mtp_gate(inspection_no_mtp_weights, tensor_gate=False) is False
 
-    # When tensor_gate=True or MTP weights exist -> passes
+    # When tensor_gate=False -> gate rejects even if individual mtp keys exist
     inspection_with_mtp = SimpleNamespace(
         model_type="qwen4_exp",
         architecture="Qwen4ExpForConditionalGeneration",
@@ -410,7 +410,8 @@ def test_qwen4_exp_mtp_gate_requires_mtp_tensors(tmp_path):
         mtp_num_hidden_layers=1,
         weight_keys=("mtp.layers.0.self_attn.q_proj.weight",),
     )
-    assert _passes_qwen4_exp_mtp_gate(inspection_with_mtp, tensor_gate=False) is True
+    assert _passes_qwen4_exp_mtp_gate(inspection_with_mtp, tensor_gate=False) is False
+    assert _passes_qwen4_exp_mtp_gate(inspection_with_mtp, tensor_gate=True) is True
     assert _passes_qwen4_exp_mtp_gate(inspection_no_mtp_weights, tensor_gate=True) is True
 
 
@@ -2878,6 +2879,114 @@ def test_qsa_indexer_chunked_select_with_vector_q_pos(monkeypatch):
     # Full attention forward with chunking
     out = attn(x, cache=cache)
     assert out.shape == (2, 6, 64)
+
+
+def test_hf_model_weight_keys_scans_direct_weights_safetensors_and_ignores_adapters(monkeypatch):
+    from mtplx.artifacts import _hf_model_weight_keys
+
+    scanned_files = []
+
+    def fake_remote_keys(repo_id, filename):
+        scanned_files.append(filename)
+        if filename == "weights.safetensors":
+            return ("mtp.fc_embedding.weight", "model.embed_tokens.weight"), None
+        return (), None
+
+    monkeypatch.setattr("mtplx.artifacts._remote_safetensors_keys", fake_remote_keys)
+
+    files = {"weights.safetensors", "adapter_model.safetensors", "mtp.safetensors"}
+    keys, error = _hf_model_weight_keys("test/repo", files)
+    assert error is None
+    assert "mtp.fc_embedding.weight" in keys
+    assert "model.embed_tokens.weight" in keys
+    assert "weights.safetensors" in scanned_files
+    assert "adapter_model.safetensors" not in scanned_files
+
+
+def test_passes_qwen4_exp_gate_and_ar_gate_exclude_adapter_only_safetensors():
+    from mtplx.artifacts import ModelInspection
+    from mtplx.backends.registry import _passes_mlx_lm_ar_gate, _passes_qwen4_exp_gate
+
+    insp = ModelInspection(
+        model_dir="remote-org/adapter-only",
+        source="hf",
+        config_exists=True,
+        architecture="Qwen4ExpForConditionalGeneration",
+        model_type="qwen4_exp",
+        mtp_num_hidden_layers=0,
+        hidden_size=1024,
+        num_hidden_layers=12,
+        vocab_size=32000,
+        model_files=("adapter_model.safetensors",),
+    )
+    assert not _passes_qwen4_exp_gate(insp)
+    assert not _passes_mlx_lm_ar_gate(insp)
+
+
+def test_passes_qwen4_exp_mtp_gate_requires_valid_tensor_gate():
+    from mtplx.artifacts import ModelInspection
+    from mtplx.backends.registry import _passes_qwen4_exp_mtp_gate
+
+    insp = ModelInspection(
+        model_dir="local/qwen4-exp",
+        source="hf",
+        config_exists=True,
+        architecture="Qwen4ExpForConditionalGeneration",
+        model_type="qwen4_exp",
+        mtp_num_hidden_layers=1,
+        hidden_size=1024,
+        num_hidden_layers=12,
+        vocab_size=32000,
+        model_files=("model.safetensors", "mtp.safetensors"),
+        weight_keys=("mtp.fc_embedding.weight",),  # Incomplete MTP keys
+    )
+    # Even if some mtp. key exists, if tensor_gate is False, gate must return False
+    assert not _passes_qwen4_exp_mtp_gate(insp, tensor_gate=False)
+    assert _passes_qwen4_exp_mtp_gate(insp, tensor_gate=True)
+
+
+def test_attn_cache_vector_offset_update_and_fetch_appends_at_active_end():
+    from mtplx.models.qwen4_exp import _AttnCache
+
+    cache = _AttnCache()
+    cache.keys = mx.ones((2, 2, 8, 32))
+    cache.values = mx.ones((2, 2, 8, 32))
+    cache.offset = mx.array([8, 4], dtype=mx.int32)
+    cache._idx = 8
+
+    # Step 1: Decode 1 token (S=1)
+    k1 = mx.ones((2, 2, 1, 32)) * 2
+    v1 = mx.ones((2, 2, 1, 32)) * 2
+    fk1, fv1 = cache.update_and_fetch(k1, v1)
+    assert fk1.shape == (2, 2, 9, 32)
+    assert cache._idx == 9
+    assert list(cache.offset.tolist()) == [9, 5]
+
+    # Step 2: Decode 2nd token (S=1)
+    k2 = mx.ones((2, 2, 1, 32)) * 3
+    v2 = mx.ones((2, 2, 1, 32)) * 3
+    fk2, fv2 = cache.update_and_fetch(k2, v2)
+    assert fk2.shape == (2, 2, 10, 32)
+    assert cache._idx == 10
+    assert list(cache.offset.tolist()) == [10, 6]
+    # Verify no gap: position 8 has token 1, position 9 has token 2
+    assert float(cache.keys[0, 0, 8, :].mean().item()) == 2.0
+    assert float(cache.keys[0, 0, 9, :].mean().item()) == 3.0
+
+
+def test_qwen4_exp_recurrent_cache_filter_rebases_padding():
+    from mtplx.qwen4_exp_mtp_patch import Qwen4ExpRecurrentCache
+
+    cache = Qwen4ExpRecurrentCache(4)
+    cache[0] = mx.ones((3, 32, 4))
+    cache.left_padding = mx.array([4, 6, 8], dtype=mx.int32)
+    cache.lengths = mx.array([12, 10, 8], dtype=mx.int32)
+
+    # Filter to retain rows [0, 1] -> left_paddings are [4, 6], min is 4
+    cache.filter(mx.array([0, 1]))
+    assert cache.batch_size == 2
+    # Rebased left_padding should be [0, 2]
+    assert list(cache.left_padding.tolist()) == [0, 2]
 
 
 

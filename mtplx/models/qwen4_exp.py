@@ -1971,11 +1971,14 @@ class _AttnCache(KVCache):
         super().__init__()
         self.indexer = _IndexerCache()
         self.left_padding = None
+        self._idx = 0
         self._mtplx_indexer_trim = True
 
     def update_and_fetch(self, keys: Any, values: Any) -> tuple[Any, Any]:
         if isinstance(getattr(self, "offset", None), mx.array):
-            prev = int(self.keys.shape[2]) if self.keys is not None else 0
+            if not hasattr(self, "_idx") or self._idx is None or self.keys is None:
+                self._idx = int(self.keys.shape[2]) if self.keys is not None else 0
+            prev = self._idx
             if self.keys is None or (prev + keys.shape[2]) > self.keys.shape[2]:
                 B, n_kv_heads, _, k_head_dim = keys.shape
                 v_head_dim = values.shape[3]
@@ -1995,6 +1998,7 @@ class _AttnCache(KVCache):
             new_idx = prev + keys.shape[2]
             self.keys[..., prev:new_idx, :] = keys
             self.values[..., prev:new_idx, :] = values
+            self._idx = new_idx
             self.offset = self.offset + keys.shape[2]
             return self.keys[..., :new_idx, :], self.values[..., :new_idx, :]
         res = super().update_and_fetch(keys, values)
@@ -2005,6 +2009,8 @@ class _AttnCache(KVCache):
     def trim(self, n: int) -> int:
         trimmed = super().trim(n)
         dropped = int(n if trimmed is None else trimmed)
+        if hasattr(self, "_idx") and self._idx is not None:
+            self._idx = max(0, self._idx - dropped)
         if hasattr(self, "indexer") and self.indexer is not None:
             if dropped:
                 self.indexer.trim(dropped)
@@ -2136,6 +2142,7 @@ class _AttnCache(KVCache):
         k2_pad, v2_pad = pad_kv(other_k, other_v, b_batch, L2)
         self.keys = mx.concatenate([k1_pad, k2_pad], axis=0)
         self.values = mx.concatenate([v1_pad, v2_pad], axis=0)
+        self._idx = max_L
         a_off = (
             self.offset.astype(mx.int32).reshape(-1)
             if isinstance(getattr(self, "offset", None), mx.array)
@@ -2234,13 +2241,14 @@ class _AttnCache(KVCache):
         merged = super().merge(caches)
         indexers = [getattr(c, "indexer", None) for c in caches]
         merged.indexer = _IndexerCache.merge(indexers)
+        lengths = [
+            getattr(c, "size", lambda: getattr(c, "offset", 0))()
+            for c in caches
+        ]
+        max_length = max(lengths) if lengths else 0
+        merged._idx = max_length
         lps = [getattr(c, "left_padding", None) for c in caches]
         if any(lp is not None for lp in lps):
-            lengths = [
-                getattr(c, "size", lambda: getattr(c, "offset", 0))()
-                for c in caches
-            ]
-            max_length = max(lengths) if lengths else 0
             lp_list = []
             for c, l in zip(caches, lengths):
                 pad_offset = max_length - l

@@ -18,6 +18,7 @@ from .constants import (
     EXPECTED_QWEN_MOE_MTP_KEYS,
     EXPECTED_QWEN_MOE_PREQUANTIZED_MTP_KEYS,
     EXPECTED_QWEN_MOE_SWITCH_MLP_MTP_KEYS,
+    EXPECTED_QWEN4_EXP_MTP_KEYS,
     MULTIMODAL_SIDECARS,
     expand_mtp_layer_keys,
 )
@@ -218,6 +219,23 @@ def _expected_prequantized_keys_for_present_aux(
     return expected
 
 
+def _is_qwen4_exp_config(config: dict[str, Any]) -> bool:
+    tcfg = config.get("text_config", config) if isinstance(config, dict) else {}
+    model_type = str(tcfg.get("model_type") or config.get("model_type") or "").lower()
+    if model_type in {"qwen4_exp", "qwen4_exp_text"}:
+        return True
+    archs = (
+        (config.get("architectures") if isinstance(config, dict) else None)
+        or tcfg.get("architectures")
+        or []
+    )
+    for arch in archs:
+        compact = str(arch).lower().replace("_", "").replace("-", "")
+        if "qwen4exp" in compact:
+            return True
+    return False
+
+
 def _mtp_expected_key_set(
     config: dict[str, Any],
     *,
@@ -233,6 +251,14 @@ def _mtp_expected_key_set(
 
     def _expanded(base: tuple[str, ...]) -> set[str]:
         return expand_mtp_layer_keys(base, n_layers)
+
+    if _is_qwen4_exp_config(config):
+        expected = _expanded(EXPECTED_QWEN4_EXP_MTP_KEYS)
+        return (
+            expected,
+            len(expected),
+            "bf16-qwen4-exp",
+        )
 
     if _is_qwen_moe_mtp_layout(config, normalized):
         if any(".mlp.switch_mlp." in key for key in normalized):
@@ -905,7 +931,20 @@ def _hf_model_weight_keys(repo_id: str, files: set[str]) -> tuple[tuple[str, ...
     for filename in sorted(
         name
         for name in files
-        if Path(name).name.startswith("model") and name.endswith(".safetensors")
+        if (
+            Path(name).name.startswith("model")
+            or Path(name).name.lower() in {"weights.safetensors", "model.safetensors"}
+            or Path(name).name.startswith("consolidated")
+        )
+        and name.endswith(".safetensors")
+        and not Path(name).name.lower().startswith("adapter")
+        and not Path(name).name.lower().startswith("optimizer")
+        and not (
+            Path(name).name.lower() in {"mtp.safetensors", "model-mtp.safetensors", "model-mtp-head.safetensors"}
+            or Path(name).name.lower().endswith("-mtp.safetensors")
+            or Path(name).name.lower().endswith("-mtp-head.safetensors")
+            or (Path(name).name.lower() == "weights.safetensors" and Path(name).parent.name.lower() == "mtp")
+        )
     ):
         shard_keys, error = _remote_safetensors_keys(repo_id, filename)
         keys.update(shard_keys)
@@ -1062,7 +1101,7 @@ def _inspect_hf_model(repo_id: str) -> ModelInspection:
         sorted(
             name
             for name in files
-            if name.endswith(".safetensors")
+            if name.endswith(".safetensors") and not Path(name).name.lower().startswith("adapter")
         )
     )
     mtp_file = str(expected_mtp_file(Path("."), config, files=files))

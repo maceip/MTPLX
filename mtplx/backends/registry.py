@@ -1170,6 +1170,18 @@ def _is_mtp_sidecar_file(path: Path) -> bool:
     return False
 
 
+def _is_trunk_safetensors(path: Path | str) -> bool:
+    p = Path(path)
+    name = p.name.lower()
+    if not name.endswith(".safetensors"):
+        return False
+    if _is_mtp_sidecar_file(p):
+        return False
+    if name.startswith("adapter") or name.startswith("optimizer") or name.startswith("training_"):
+        return False
+    return True
+
+
 def _passes_deepseek_v4_gate(inspection: Any) -> bool:
     """DeepSeek-V4-Flash MLX artifact: model_type deepseek_v4 (or the
     DeepseekV4ForCausalLM architecture).  The mlx-community conversion drops the
@@ -1196,18 +1208,18 @@ def _passes_qwen4_exp_gate(inspection: Any) -> bool:
     if source == "hf":
         model_files = getattr(inspection, "model_files", ()) or ()
         has_trunk = any(
-            not _is_mtp_sidecar_file(Path(fname))
+            _is_trunk_safetensors(Path(fname))
             for fname in model_files
         )
         if not has_trunk and getattr(inspection, "weight_keys", None):
             has_trunk = any(
-                not (k.startswith("mtp.") or k.startswith("language_model.mtp."))
+                not (k.startswith("mtp.") or k.startswith("language_model.mtp.") or k.startswith("adapter_"))
                 for k in inspection.weight_keys
             )
     else:
         try:
             has_trunk = any(
-                not _is_mtp_sidecar_file(path)
+                _is_trunk_safetensors(path)
                 for path in Path(str(model_dir)).glob("*.safetensors")
             )
         except OSError:
@@ -1223,12 +1235,7 @@ def _passes_qwen4_exp_mtp_gate(inspection: Any, tensor_gate: bool) -> bool:
     """Qwen4-Exp MTP artifact: valid Qwen4-Exp model plus declared MTP tensors."""
     if not _passes_qwen4_exp_gate(inspection):
         return False
-    keys = _weight_keys(inspection)
-    has_mtp_tensors = bool(
-        tensor_gate
-        or any(_is_sidecar_mtp_key(k) or "mtp." in k for k in (keys or ()))
-    )
-    return bool(has_mtp_tensors)
+    return bool(tensor_gate)
 
 
 def _passes_mlx_lm_ar_gate(inspection: Any) -> bool:
@@ -1240,18 +1247,18 @@ def _passes_mlx_lm_ar_gate(inspection: Any) -> bool:
     if source == "hf":
         model_files = getattr(inspection, "model_files", ()) or ()
         has_trunk = any(
-            not _is_mtp_sidecar_file(Path(fname))
+            _is_trunk_safetensors(Path(fname))
             for fname in model_files
         )
         if not has_trunk and getattr(inspection, "weight_keys", None):
             has_trunk = any(
-                not (k.startswith("mtp.") or k.startswith("language_model.mtp."))
+                not (k.startswith("mtp.") or k.startswith("language_model.mtp.") or k.startswith("adapter_"))
                 for k in inspection.weight_keys
             )
     else:
         try:
             has_trunk = any(
-                not _is_mtp_sidecar_file(path)
+                _is_trunk_safetensors(path)
                 for path in Path(str(model_dir)).glob("*.safetensors")
             )
         except OSError:
@@ -1694,18 +1701,18 @@ def compatibility_for_inspection(inspection: Any) -> CompatibilityVerdict:
             if source == "hf":
                 model_files = getattr(inspection, "model_files", ()) or ()
                 trunk_weights_exist = any(
-                    not _is_mtp_sidecar_file(Path(fname))
+                    _is_trunk_safetensors(Path(fname))
                     for fname in model_files
                 )
                 if not trunk_weights_exist and getattr(inspection, "weight_keys", None):
                     trunk_weights_exist = any(
-                        not (k.startswith("mtp.") or k.startswith("language_model.mtp."))
+                        not (k.startswith("mtp.") or k.startswith("language_model.mtp.") or k.startswith("adapter_"))
                         for k in inspection.weight_keys
                     )
             else:
                 try:
                     trunk_weights_exist = any(
-                        not _is_mtp_sidecar_file(path)
+                        _is_trunk_safetensors(path)
                         for path in Path(model_dir).glob("*.safetensors")
                     )
                 except OSError:

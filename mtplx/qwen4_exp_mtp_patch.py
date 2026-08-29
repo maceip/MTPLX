@@ -753,6 +753,10 @@ class Qwen4ExpRecurrentCache:
         self.cache = [c[batch_indices] if c is not None else None for c in self.cache]
         if self.left_padding is not None:
             self.left_padding = self.left_padding[batch_indices]
+            if getattr(self.left_padding, "size", 0) > 0:
+                min_left_pad = int(self.left_padding.min().item())
+                if min_left_pad > 0:
+                    self.left_padding -= min_left_pad
         if self.lengths is not None:
             self.lengths = self.lengths[batch_indices]
 
