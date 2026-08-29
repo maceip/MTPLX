@@ -626,7 +626,11 @@ class QSAIndexer(nn.Module):
                     )
                 new_pooled = self.k_layernorm(new_pooled.astype(raw_k.dtype))
                 new_starts = mx.arange(n_cached, n_blocks) * r
-                cos_k, sin_k = rope(new_starts[None, :])
+                if left_padding is not None:
+                    logical_starts = mx.maximum(0, new_starts[None, :] - left_padding[:, None])
+                    cos_k, sin_k = rope(logical_starts)
+                else:
+                    cos_k, sin_k = rope(new_starts[None, :])
                 new_pooled = _rope_partial(new_pooled, cos_k, sin_k)
                 pooled = (
                     new_pooled
@@ -659,7 +663,11 @@ class QSAIndexer(nn.Module):
                 )
             pooled = self.k_layernorm(pooled.astype(raw_k.dtype))
             block_starts = mx.arange(n_blocks) * r
-            cos_k, sin_k = rope(block_starts[None, :])
+            if left_padding is not None:
+                logical_starts = mx.maximum(0, block_starts[None, :] - left_padding[:, None])
+                cos_k, sin_k = rope(logical_starts)
+            else:
+                cos_k, sin_k = rope(block_starts[None, :])
             pooled = _rope_partial(pooled, cos_k, sin_k)
 
         if isinstance(offset, mx.array):

@@ -3251,6 +3251,60 @@ def test_loaded_weights_bytes_resolves_cached_and_remote_hf_refs(monkeypatch, tm
     assert _loaded_weights_bytes_for_model_path("Qwen/Qwen4-Exp-72B-4bit") == 9000
 
 
+def test_qsa_indexer_rotates_pooled_keys_at_logical_positions():
+    from mtplx.models.qwen4_exp import QSAIndexer, TextArgs, RotaryEmbedding, _rope_partial, _IndexerCache
+
+    args = TextArgs(
+        hidden_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        indexer_n_heads=2,
+        indexer_kv_heads=1,
+        indexer_head_dim=16,
+        indexer_budget=4,
+        indexer_compress_ratio=4,
+    )
+    indexer = QSAIndexer(args)
+    rope = RotaryEmbedding(args.indexer_head_dim, 10000.0)
+
+    # Single row unpadded: 8 tokens -> 2 blocks at logical starts 0, 4
+    x_single = mx.ones((1, 8, args.hidden_size))
+    cache_single = _IndexerCache()
+    prep_single = indexer.prepare(x_single, rope, cache_single, offset=0)
+    assert cache_single.pooled is not None
+    pooled_single = cache_single.pooled
+
+    # Padded row: 4 left pad tokens + 4 real tokens -> 8 total tokens.
+    # Block 0 is padding (tokens 0..3), Block 1 is real tokens (tokens 4..7).
+    # Real block 1 should be rotated at logical start (4 - 4 = 0).
+    x_padded = mx.ones((1, 8, args.hidden_size))
+    cache_padded = _IndexerCache()
+    cache_padded.left_padding = mx.array([4], dtype=mx.int32)
+    prep_padded = indexer.prepare(x_padded, rope, cache_padded, offset=0)
+    assert cache_padded.pooled is not None
+    pooled_padded = cache_padded.pooled
+
+    # Pooled vector for real block (block 1 in padded, block 0 in single) should match in rotation
+    assert mx.allclose(pooled_padded[0, 1, :], pooled_single[0, 0, :], atol=1e-5)
+
+
+def test_expected_mtp_file_discovers_local_wildcard_sidecars(tmp_path):
+    from mtplx.artifacts import expected_mtp_file
+
+    model_dir = tmp_path / "custom_qwen4"
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text('{"model_type": "qwen4_exp"}')
+
+    # Wildcard suffix sidecar
+    sidecar = model_dir / "qwen4-mtp-head.safetensors"
+    sidecar.write_bytes(b"mtp_head")
+
+    found = expected_mtp_file(model_dir)
+    assert found == sidecar
+
+
 
 
 

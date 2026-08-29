@@ -485,6 +485,20 @@ def expected_mtp_file(
         candidate = model_path / rel
         if candidate.exists():
             return candidate
+    if model_path.is_dir():
+        for p in sorted(model_path.glob("*.safetensors")):
+            fname = p.name.lower()
+            if (
+                fname == "mtp.safetensors"
+                or fname == "model-mtp.safetensors"
+                or fname == "model-mtp-head.safetensors"
+                or fname.endswith("-mtp.safetensors")
+                or fname.endswith("-mtp-head.safetensors")
+            ):
+                return p
+        mtp_sub = model_path / "mtp" / "weights.safetensors"
+        if mtp_sub.is_file():
+            return mtp_sub
     return model_path / "mtp.safetensors"
 
 
