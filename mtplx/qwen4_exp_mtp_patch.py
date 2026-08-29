@@ -337,21 +337,27 @@ def _shift_qwen4_gemma_mtp_norms(
     ]
     if not targets:
         return weights
-    for key, value in targets:
-        if str(key).endswith("pre_fc_norm_embedding.weight") or str(key).endswith(
-            "pre_fc_norm_hidden.weight"
-        ):
-            try:
-                if float(value.mean().item()) > 0.5:
-                    return weights
-            except Exception:
-                pass
-    try:
-        means = [float(v.mean().item()) for _, v in targets]
-        if sum(means) / len(means) > 0.5:
-            return weights
-    except Exception:
-        pass
+
+    pre_fc_targets = [
+        (key, value)
+        for key, value in targets
+        if str(key).endswith("pre_fc_norm_embedding.weight")
+        or str(key).endswith("pre_fc_norm_hidden.weight")
+    ]
+    if pre_fc_targets:
+        try:
+            pre_fc_means = [float(v.mean().item()) for _, v in pre_fc_targets]
+            if sum(pre_fc_means) / len(pre_fc_means) > 0.5:
+                return weights
+        except Exception:
+            pass
+    else:
+        try:
+            means = [float(v.mean().item()) for _, v in targets]
+            if sum(means) / len(means) > 0.5:
+                return weights
+        except Exception:
+            pass
 
     out = dict(weights)
     for key, value in targets:
@@ -1923,12 +1929,16 @@ def _rebuild_exact_mtp_cells(
     mtp_snaps[0].restore(mtp_cache)
     for j, tok in enumerate(accepted):
         if j < len(step_hiddens):
-            _logits, _h = model.mtp_forward(
+            res = model.mtp_forward(
                 step_hiddens[j],
                 mx.array([[int(tok)]], dtype=mx.int32),
                 mtp_cache=mtp_cache,
+                return_hidden=True,
             )
-            mx.eval(_logits, _h)
+            if isinstance(res, tuple):
+                mx.eval(*res)
+            else:
+                mx.eval(res)
 
 
 def speculative_generate(

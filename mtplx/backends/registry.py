@@ -1214,7 +1214,7 @@ def _passes_qwen4_exp_gate(inspection: Any) -> bool:
             return False
     if not has_trunk:
         return False
-    return _unsupported_quant_bits(model_dir) is None
+    return _unsupported_quant_bits(model_dir, inspection=inspection) is None
 
 
 def _passes_qwen4_exp_mtp_gate(inspection: Any, tensor_gate: bool) -> bool:
@@ -1256,7 +1256,7 @@ def _passes_mlx_lm_ar_gate(inspection: Any) -> bool:
             return False
     if not has_trunk:
         return False
-    return _unsupported_quant_bits(model_dir) is None
+    return _unsupported_quant_bits(model_dir, inspection=inspection) is None
 
 
 # mlx.core.quantize supports exactly these widths; a config declaring any
@@ -1265,21 +1265,56 @@ def _passes_mlx_lm_ar_gate(inspection: Any) -> bool:
 _MLX_SUPPORTED_QUANT_BITS = frozenset({2, 3, 4, 5, 6, 8})
 
 
-def _unsupported_quant_bits(model_dir: Any) -> int | None:
+def _unsupported_quant_bits(
+    model_dir: Any, inspection: Any = None
+) -> int | None:
     """Return the declared quant bit width when this MLX build cannot load it."""
-    try:
-        config = json.loads(
-            (Path(str(model_dir)) / "config.json").read_text(encoding="utf-8")
-        )
-    except (OSError, ValueError):
-        return None
-    quantization = config.get("quantization")
-    if not isinstance(quantization, dict):
-        return None
-    candidates = [quantization.get("bits")]
-    for value in quantization.values():
-        if isinstance(value, dict):
-            candidates.append(value.get("bits"))
+    config = None
+    if isinstance(model_dir, dict):
+        config = model_dir
+    elif inspection is not None and getattr(inspection, "config", None):
+        config = inspection.config
+    elif inspection is not None and isinstance(getattr(inspection, "quantization", None), dict):
+        config = {"quantization": getattr(inspection, "quantization")}
+
+    if config is None:
+        try:
+            config = json.loads(
+                (Path(str(model_dir)) / "config.json").read_text(encoding="utf-8")
+            )
+        except (OSError, ValueError):
+            config = {}
+
+    quant_dicts = []
+    if isinstance(config, dict):
+        if isinstance(config.get("quantization"), dict):
+            quant_dicts.append(config["quantization"])
+        if isinstance(config.get("quantization_config"), dict):
+            quant_dicts.append(config["quantization_config"])
+        tcfg = config.get("text_config")
+        if isinstance(tcfg, dict):
+            if isinstance(tcfg.get("quantization"), dict):
+                quant_dicts.append(tcfg["quantization"])
+            if isinstance(tcfg.get("quantization_config"), dict):
+                quant_dicts.append(tcfg["quantization_config"])
+
+    if inspection is not None:
+        iq = getattr(inspection, "quantization", None)
+        if isinstance(iq, dict):
+            quant_dicts.append(iq)
+        iqc = getattr(inspection, "quantization_config", None)
+        if isinstance(iqc, dict):
+            quant_dicts.append(iqc)
+
+    candidates = []
+    for q in quant_dicts:
+        candidates.append(q.get("bits"))
+        candidates.append(q.get("weight_bits"))
+        for value in q.values():
+            if isinstance(value, dict):
+                candidates.append(value.get("bits"))
+                candidates.append(value.get("weight_bits"))
+
     for bits in candidates:
         if isinstance(bits, int) and not isinstance(bits, bool):
             if bits not in _MLX_SUPPORTED_QUANT_BITS:
@@ -1399,7 +1434,7 @@ def compatibility_for_inspection(inspection: Any) -> CompatibilityVerdict:
             support_level="trust-remote-code-refused",
             support_notes=(support.notes if support else None),
         )
-    bad_bits = _unsupported_quant_bits(model_dir)
+    bad_bits = _unsupported_quant_bits(model_dir, inspection=inspection)
     if bad_bits is not None:
         support = architecture_support_for(detected_arch_id)
         return CompatibilityVerdict(
@@ -1639,13 +1674,26 @@ def compatibility_for_inspection(inspection: Any) -> CompatibilityVerdict:
             # A dir with no TRUNK weights at all is a different failure — no
             # model, not a missing head — and keeps a clean human refusal
             # instead of a FileNotFoundError deep in the loader.
-            try:
+            source = getattr(inspection, "source", None)
+            if source == "hf":
+                model_files = getattr(inspection, "model_files", ()) or ()
                 trunk_weights_exist = any(
-                    not _is_mtp_sidecar_file(path)
-                    for path in Path(model_dir).glob("*.safetensors")
+                    not _is_mtp_sidecar_file(Path(fname))
+                    for fname in model_files
                 )
-            except OSError:
-                trunk_weights_exist = False
+                if not trunk_weights_exist and getattr(inspection, "weight_keys", None):
+                    trunk_weights_exist = any(
+                        not (k.startswith("mtp.") or k.startswith("language_model.mtp."))
+                        for k in inspection.weight_keys
+                    )
+            else:
+                try:
+                    trunk_weights_exist = any(
+                        not _is_mtp_sidecar_file(path)
+                        for path in Path(model_dir).glob("*.safetensors")
+                    )
+                except OSError:
+                    trunk_weights_exist = False
             if not trunk_weights_exist:
                 return CompatibilityVerdict(
                     tier=TIER_ARCH_COMPATIBLE_UNVERIFIED,

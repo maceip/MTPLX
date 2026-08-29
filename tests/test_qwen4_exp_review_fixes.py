@@ -2363,6 +2363,116 @@ def test_rebuild_exact_mtp_cells_restores_and_replays_target_hiddens():
     assert mock_model.mtp_forward.call_count == 2
 
 
+def test_compatibility_missing_head_fallback_uses_remote_shards():
+    from types import SimpleNamespace
+    from mtplx.backends.registry import compatibility_for_inspection
+
+    inspection = SimpleNamespace(
+        model_dir="dummy/repo-id",
+        source="hf",
+        model_type="qwen4_exp",
+        architecture="Qwen4ExpForCausalLM",
+        model_files=["model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors"],
+        weight_keys=None,
+        config={
+            "model_type": "qwen4_exp",
+            "mtp_num_hidden_layers": 1,
+        },
+        mtp_file=None,
+        quantization=None,
+        quantization_config=None,
+    )
+    verdict = compatibility_for_inspection(inspection)
+    assert verdict.arch_id == "qwen4-exp"
+    assert verdict.can_run is True
+
+
+def test_model_classes_for_config_checks_nested_architectures():
+    from mtplx.runtime import _model_classes_for_config
+    from mtplx.models.qwen4_exp import Model, ModelArgs
+
+    config = {
+        "text_config": {
+            "architectures": ["Qwen4ExpForCausalLM"],
+        }
+    }
+    classes = _model_classes_for_config(config)
+    assert classes is not None
+    assert classes == (Model, ModelArgs)
+
+
+def test_unsupported_quant_bits_rejects_quantization_config():
+    from mtplx.backends.registry import _unsupported_quant_bits
+
+    cfg1 = {"quantization_config": {"bits": 1}}
+    assert _unsupported_quant_bits(cfg1) == 1
+
+    cfg4 = {"quantization_config": {"bits": 4}}
+    assert _unsupported_quant_bits(cfg4) is None
+
+
+def test_shift_qwen4_gemma_mtp_norms_trusts_raw_pre_fc_norms():
+    from mtplx.qwen4_exp_mtp_patch import _shift_qwen4_gemma_mtp_norms
+
+    raw_weights = {
+        "pre_fc_norm_embedding.weight": mx.zeros((128,)),
+        "pre_fc_norm_hidden.weight": mx.zeros((128,)),
+        "layers.0.self_attn.q_norm.weight": mx.full((64,), 2.5),
+        "layers.0.self_attn.k_norm.weight": mx.full((64,), 2.5),
+    }
+    shifted = _shift_qwen4_gemma_mtp_norms(raw_weights)
+    assert float(shifted["pre_fc_norm_embedding.weight"].mean().item()) == 1.0
+    assert float(shifted["pre_fc_norm_hidden.weight"].mean().item()) == 1.0
+    assert float(shifted["layers.0.self_attn.q_norm.weight"].mean().item()) == 3.5
+
+
+def test_qwen4_server_applies_family_sampler_defaults(monkeypatch):
+    import argparse
+    from unittest.mock import MagicMock
+    from mtplx.server import openai
+    from mtplx.models.qwen4_exp import Model, ModelArgs
+
+    config = {
+        "model_type": "qwen4_exp",
+        "hidden_size": 64,
+        "num_hidden_layers": 1,
+        "num_attention_heads": 2,
+        "num_key_value_heads": 2,
+        "head_dim": 32,
+        "vocab_size": 50,
+        "layer_types": ["full_attention"],
+    }
+    dummy_model = Model(ModelArgs.from_dict(config))
+    dummy_runtime = MagicMock()
+    dummy_runtime.model = dummy_model
+    dummy_runtime.mtp_enabled = False
+    dummy_runtime.tokenizer = MagicMock()
+    dummy_runtime.laguna_fused_report = None
+
+    monkeypatch.setattr(openai, "load_runtime_contract", lambda *args, **kwargs: (None, None))
+    monkeypatch.setattr(openai, "load", lambda *args, **kwargs: dummy_runtime)
+    monkeypatch.setattr(openai, "_resolve_context_window", lambda *args, **kwargs: 4096)
+    monkeypatch.setattr(openai, "_apply_metal_memory_caps", lambda *args, **kwargs: {"applied": True})
+    monkeypatch.setattr(openai, "_configure_mlx_cache_limit", lambda *args, **kwargs: {"configured": False})
+    monkeypatch.setattr(openai, "_fast_path_env_status", lambda *args, **kwargs: {})
+    monkeypatch.setattr(openai, "_mlx_runtime_status", lambda *args, **kwargs: {"ok": True})
+    monkeypatch.setattr(openai, "profile_env_status", lambda *args, **kwargs: {})
+    monkeypatch.setattr(openai, "_apply_chat_template_profile", lambda *args, **kwargs: {"profile": "tokenizer"})
+
+    # 1. Without explicit temperature: default 0.6 is updated to family default 1.0
+    args1 = openai.parse_args(["--model", "Qwen/Qwen3.8-Flash-Next"])
+    assert args1.temperature == 0.6
+    state1 = openai.ServerState(args1)
+    assert state1.args.temperature == 1.0
+
+    # 2. With explicit temperature: explicit value is preserved
+    args2 = openai.parse_args(["--model", "Qwen/Qwen3.8-Flash-Next", "--temperature", "0.7"])
+    assert args2.temperature == 0.7
+    state2 = openai.ServerState(args2)
+    assert state2.args.temperature == 0.7
+
+
+
 
 
 

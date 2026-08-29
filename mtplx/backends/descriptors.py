@@ -1002,7 +1002,12 @@ _QWEN3_8_MARKER = re.compile(r"qwen3[._-]?8(?!\d*b)")
 
 
 def _explicit_qwen_family_marker(text: str) -> str | None:
-    if "qwen4_exp" in text or "qwen4-exp" in text or "flash-next" in text or "flash.next" in text:
+    if (
+        "qwen4" in text
+        or "flash-next" in text
+        or "flash.next" in text
+        or "qwen4exp" in text
+    ):
         return "qwen4_exp"
     if _QWEN3_8_MARKER.search(text):
         return "qwen3_8"
@@ -1085,6 +1090,8 @@ def model_family_from_inspection(
         if descriptor is not None
         else backend_id_from_inspection(inspection)
     )
+    if backend_id in {"qwen4_exp", "qwen4_exp_mtp"} or "qwen4" in backend_id:
+        return "qwen4_exp"
     if backend_id == GEMMA4_ASSISTANT_DESCRIPTOR.backend_id or "gemma4" in text or "gemma-4" in text:
         return "gemma4"
     if backend_id == STEP3P5_MTP_DESCRIPTOR.backend_id or "step3p5" in text or "step3p7" in text or "step-3.7" in text:

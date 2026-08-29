@@ -93,6 +93,7 @@ from mtplx.backends.descriptors import (
     model_controls_for_descriptor,
     model_family_from_inspection,
     reasoning_policy_for_model,
+    sampler_defaults_for_model,
     set_draft_control_arg,
     sync_backend_arg_aliases,
     target_distribution_mode_from_args,
@@ -2200,6 +2201,7 @@ class ServerState:
         from mtplx.backends.descriptors import (
             QWEN4_EXP_DRAFT_SEMANTICS,
             draft_semantics_for_model,
+            sampler_defaults_for_model,
         )
         from mtplx.qwen4_exp_mtp_patch import qwen4_exp_product_verify_strategy
 
@@ -2215,6 +2217,19 @@ class ServerState:
                 model_ref=getattr(args, "model", None) or getattr(args, "model_id", None),
                 descriptor=self.backend_descriptor,
             )
+        loaded_sampler_defaults = sampler_defaults_for_model(
+            model_ref=getattr(args, "model", None) or getattr(args, "model_id", None),
+            descriptor=self.backend_descriptor,
+        )
+        explicit_flags = getattr(args, "_cli_flags", None)
+        if explicit_flags is None:
+            explicit_flags = set()
+        if not _server_flag_present(explicit_flags, "temperature", "default-temperature"):
+            args.temperature = float(loaded_sampler_defaults.temperature)
+        if not _server_flag_present(explicit_flags, "top-p", "default-top-p"):
+            args.top_p = float(loaded_sampler_defaults.top_p)
+        if not _server_flag_present(explicit_flags, "top-k"):
+            args.top_k = int(loaded_sampler_defaults.top_k)
         if not getattr(args, "_explicit_depth", False):
             set_draft_control_arg(
                 args,

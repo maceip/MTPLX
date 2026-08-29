@@ -1068,7 +1068,15 @@ def _model_classes_for_config(config: dict[str, Any]) -> tuple[type, type] | Non
         or (config.get("text_config") or {}).get("model_type")
         or ""
     ).lower()
-    archs = [str(a).lower() for a in (config.get("architectures") or [])]
+    tcfg = config.get("text_config") if isinstance(config.get("text_config"), dict) else {}
+    archs = [
+        str(a).lower().replace("_", "").replace("-", "")
+        for a in (
+            (config.get("architectures") if isinstance(config, dict) else None)
+            or tcfg.get("architectures")
+            or []
+        )
+    ]
     if mtype in {"qwen4_exp", "qwen4_exp_text"} or any("qwen4exp" in a for a in archs):
         from .models.qwen4_exp import Model, ModelArgs
 
