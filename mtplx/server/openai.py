@@ -808,6 +808,7 @@ def _server_runtime_env_overrides(
         for key in (
             "MTPLX_AR_PIPELINE",
             "MTPLX_COMPILED_GDN",
+            "MTPLX_QWEN4EXP_COMPILE",
             "MTPLX_FAMILY_CAPTURE_COMMIT",
             "MTPLX_FUSED_HC_V3",
             "MTPLX_FUSED_GDN_INPROJ",

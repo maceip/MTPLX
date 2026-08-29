@@ -151,11 +151,50 @@ class TextArgs(BaseModelArgs):
         return int(eos if eos is not None else 0)
 
 
-def _rope_cos_sin(positions: mx.array, inv_freq: mx.array) -> tuple[mx.array, mx.array]:
+def _build_rope_inv_freq(
+    dim: int, base: float, rope_parameters: Optional[Dict[str, Any]] = None
+) -> tuple[mx.array, float]:
+    mscale = 1.0
+    inv_freq = base ** (-mx.arange(0, dim, 2, dtype=mx.float32) / dim)
+    rp = rope_parameters or {}
+    rope_type = str(rp.get("rope_type", rp.get("type", "default"))).lower()
+    if rope_type == "yarn":
+        factor = float(rp.get("factor", 1.0))
+        orig = float(rp.get("original_max_position_embeddings", 262144))
+        beta_fast = float(rp.get("beta_fast", 32))
+        beta_slow = float(rp.get("beta_slow", 1))
+
+        def _corr_dim(num_rotations: float) -> float:
+            return (
+                dim * math.log(orig / (num_rotations * 2 * math.pi))
+            ) / (2 * math.log(base))
+
+        low = max(math.floor(_corr_dim(beta_fast)), 0)
+        high = min(math.ceil(_corr_dim(beta_slow)), dim - 1)
+        if low == high:
+            high += 0.001
+        ramp = mx.clip(
+            (mx.arange(dim // 2, dtype=mx.float32) - low) / (high - low), 0, 1
+        )
+        freq_mask = 1.0 - ramp
+        freq_extra = base ** (mx.arange(0, dim, 2, dtype=mx.float32) / dim)
+        freq_inter = factor * freq_extra
+        periods = (freq_inter * freq_extra) / (
+            freq_inter * freq_mask + freq_extra * (1.0 - freq_mask)
+        )
+        inv_freq = 1.0 / periods
+        if factor > 1:
+            mscale = 0.1 * math.log(factor) + 1.0
+    return inv_freq, mscale
+
+
+def _rope_cos_sin(
+    positions: mx.array, inv_freq: mx.array, mscale: float = 1.0
+) -> tuple[mx.array, mx.array]:
     """Non-interleaved (rotate-half) rope tables for arbitrary integer positions."""
     angles = positions.astype(mx.float32)[:, None] * inv_freq[None, :]
     emb = mx.concatenate([angles, angles], axis=-1)
-    return mx.cos(emb), mx.sin(emb)
+    return mx.cos(emb) * mscale, mx.sin(emb) * mscale
 
 
 def _apply_partial_rope(x: mx.array, cos: mx.array, sin: mx.array) -> mx.array:
@@ -1203,8 +1242,8 @@ class QSAIndexer(nn.Module):
         self.q_layernorm = nn.RMSNorm(self.head_dim, eps=args.rms_norm_eps)
         self.k_layernorm = nn.RMSNorm(self.head_dim, eps=args.rms_norm_eps)
         rot = args.rotary_dim
-        self._inv_freq = args.rope_theta ** (
-            -mx.arange(0, rot, 2, dtype=mx.float32) / rot
+        self._inv_freq, self._mscale = _build_rope_inv_freq(
+            rot, args.rope_theta, args.rope_parameters
         )
 
     def _extend_pooled(self, cache: QSACache, total: int) -> Optional[mx.array]:
@@ -1216,7 +1255,7 @@ class QSAIndexer(nn.Module):
             pooled = mx.mean(fresh.astype(mx.float32), axis=2).astype(fresh.dtype)
             pooled = self.k_layernorm(pooled)
             starts = mx.arange(nb_old, nb_total, dtype=mx.int32) * self.ratio
-            cos, sin = _rope_cos_sin(starts, self._inv_freq)
+            cos, sin = _rope_cos_sin(starts, self._inv_freq, self._mscale)
             pooled = _apply_partial_rope(pooled[:, :, None, :], cos, sin)[:, :, 0, :]
             cache.write_pooled(pooled, nb_old, nb_total)
         if nb_total == 0:
@@ -1241,7 +1280,7 @@ class QSAIndexer(nn.Module):
         k = k.reshape(B, S, self.head_dim)
         q = self.q_layernorm(q)
         positions = mx.arange(pos_start, pos_start + S, dtype=mx.int32)
-        cos, sin = _rope_cos_sin(positions, self._inv_freq)
+        cos, sin = _rope_cos_sin(positions, self._inv_freq, self._mscale)
         q = _apply_partial_rope(q, cos, sin)
 
         cache.write_raw(k)
@@ -1440,8 +1479,8 @@ class Attention(nn.Module):
         self.k_norm = nn.RMSNorm(self.head_dim, eps=args.rms_norm_eps)
         self.indexer = QSAIndexer(args) if args.indexer_n_heads else None
         rot = args.rotary_dim
-        self._inv_freq = args.rope_theta ** (
-            -mx.arange(0, rot, 2, dtype=mx.float32) / rot
+        self._inv_freq, self._mscale = _build_rope_inv_freq(
+            rot, args.rope_theta, args.rope_parameters
         )
 
     def __call__(self, x: mx.array, cache: QSACache) -> mx.array:
@@ -1481,7 +1520,7 @@ class Attention(nn.Module):
         q = self.q_norm(q)
         k = self.k_norm(k)
         positions = mx.arange(pos_start, pos_start + S, dtype=mx.int32)
-        cos, sin = _rope_cos_sin(positions, self._inv_freq)
+        cos, sin = _rope_cos_sin(positions, self._inv_freq, self._mscale)
         q = _apply_partial_rope(q, cos, sin)
         k = _apply_partial_rope(k, cos, sin)
 
@@ -2199,8 +2238,8 @@ class Qwen4ExpTextModel(nn.Module):
             self.ssm_idx,
         )
         self._gdn_compiled_env = (
-            os.environ.get("MTPLX_COMPILED_GDN", "0").strip().lower()
-            in {"1", "true", "yes", "on"}
+            os.environ.get("MTPLX_COMPILED_GDN", "0").strip().lower() in {"1", "true", "yes", "on"}
+            or os.environ.get("MTPLX_QWEN4EXP_COMPILE", "0").strip().lower() in {"1", "true", "yes", "on"}
         )
         self._gdn_compiled_lane = False
         self._decode_runs = None
