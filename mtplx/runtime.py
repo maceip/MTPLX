@@ -812,6 +812,17 @@ def load(
                 "serving autoregressive (no speculative draft head).",
                 path,
             )
+    if not mtp_enabled:
+        if hasattr(model, "clear_mtp_weights"):
+            model.clear_mtp_weights()
+        elif hasattr(model, "_mtp_weights"):
+            model._mtp_weights = {}
+        text_m = getattr(model, "model", None)
+        if text_m is not None:
+            if hasattr(text_m, "clear_mtp_weights"):
+                text_m.clear_mtp_weights()
+            elif hasattr(text_m, "_mtp_weights"):
+                text_m._mtp_weights = {}
     compiled_target_factory = None
     whole_moe_plan = None
     selfcheck_report = None

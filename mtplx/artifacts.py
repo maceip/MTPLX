@@ -524,6 +524,9 @@ class ModelInspection:
     mtp_pattern: str | None = None
     source: str = "local"
     quantization: dict[str, Any] = field(default_factory=dict)
+    config: dict[str, Any] = field(default_factory=dict)
+    auto_map: dict[str, Any] | None = None
+    requires_remote_code: bool = False
     sidecars: dict[str, bool] = field(default_factory=dict)
     model_files: tuple[str, ...] = ()
     weight_keys: tuple[str, ...] = field(default_factory=tuple, repr=False)
@@ -572,6 +575,8 @@ class ModelInspection:
             "laguna_s_2_1_mlx_4bit_match": self.laguna_s_2_1_mlx_4bit_match,
             "laguna_s_2_1_artifacts_complete": self.laguna_s_2_1_artifacts_complete,
             "quantization": self.quantization,
+            "auto_map": self.auto_map,
+            "requires_remote_code": self.requires_remote_code,
             "sidecars": self.sidecars,
             "model_files": list(self.model_files),
             "passes_primary_gate": self.passes_primary_gate,
@@ -1101,10 +1106,28 @@ def _inspect_hf_model(repo_id: str) -> ModelInspection:
             expected_tensor_count=mtp.expected_tensor_count,
             metadata_only=True,
         )
+    tokenizer_config = None
+    if files is None or "tokenizer_config.json" in files:
+        tokenizer_config, _t_path, _t_error = _hf_download_json(
+            repo_id,
+            "tokenizer_config.json",
+            **revision_kwargs,
+        )
+    auto_map = None
+    if isinstance(config, dict) and isinstance(config.get("auto_map"), dict) and config.get("auto_map"):
+        auto_map = config.get("auto_map")
+    elif isinstance(tcfg, dict) and isinstance(tcfg.get("auto_map"), dict) and tcfg.get("auto_map"):
+        auto_map = tcfg.get("auto_map")
+    elif isinstance(tokenizer_config, dict) and isinstance(tokenizer_config.get("auto_map"), dict) and tokenizer_config.get("auto_map"):
+        auto_map = tokenizer_config.get("auto_map")
+
     inspection = ModelInspection(
         model_dir=repo_id,
         source="hf",
         config_exists=True,
+        config=config,
+        auto_map=auto_map,
+        requires_remote_code=bool(auto_map),
         architecture=architecture,
         model_type=tcfg.get("model_type") or config.get("model_type"),
         mtp_num_hidden_layers=_num_mtp_layers(config),
@@ -1149,6 +1172,9 @@ def _inspect_hf_model(repo_id: str) -> ModelInspection:
         laguna_s_2_1_artifacts_complete=inspection.laguna_s_2_1_artifacts_complete,
         mtp_pattern=inspection.mtp_pattern,
         quantization=inspection.quantization,
+        config=inspection.config,
+        auto_map=inspection.auto_map,
+        requires_remote_code=inspection.requires_remote_code,
         sidecars=inspection.sidecars,
         model_files=inspection.model_files,
         weight_keys=inspection.weight_keys,

@@ -2688,7 +2688,7 @@ def test_attn_cache_and_indexer_extend_aligns_differing_histories_and_paddings()
     # Both rows aligned to max_L = 8
     assert c1.keys.shape == (2, 2, 8, 32)
     assert c1.values.shape == (2, 2, 8, 32)
-    assert c1.offset == 8
+    assert list(c1.offset.tolist()) == [8, 4]
     # c2 was padded on the left by 4, so its left_padding becomes 0 + 4 = 4
     assert list(c1.left_padding.tolist()) == [2, 4]
 
@@ -2701,6 +2701,107 @@ def test_attn_cache_and_indexer_extend_aligns_differing_histories_and_paddings()
     assert list(c1.indexer.left_padding.tolist()) == [2, 4]
     assert float(c1.indexer.keys[1, :4, :].abs().max().item()) == 0.0
     assert float(c1.indexer.keys[1, 4:, :].mean().item()) == 2.0
+
+
+def test_attn_cache_extend_preserves_per_row_rope_offset():
+    from mtplx.models.qwen4_exp import Attention, TextArgs, _AttnCache
+
+    args = TextArgs(
+        hidden_size=64,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        head_dim=32,
+        indexer_n_heads=2,
+        indexer_kv_heads=1,
+        indexer_head_dim=32,
+        indexer_budget=16,
+        indexer_compress_ratio=4,
+        layer_types=["full_attention"],
+    )
+    attn = Attention(args)
+
+    c1 = _AttnCache()
+    c1.keys = mx.ones((1, 2, 8, 32))
+    c1.values = mx.ones((1, 2, 8, 32))
+    c1.offset = 8
+
+    c2 = _AttnCache()
+    c2.keys = mx.ones((1, 2, 4, 32))
+    c2.values = mx.ones((1, 2, 4, 32))
+    c2.offset = 4
+
+    c1.extend(c2)
+    assert list(c1.offset.tolist()) == [8, 4]
+
+    # Next decode token (S=1, batch=2)
+    x = mx.ones((2, 1, 64))
+    out = attn(x, cache=c1)
+    assert out.shape == (2, 1, 64)
+    assert list(c1.offset.tolist()) == [9, 5]
+
+
+def test_passes_qwen4_exp_gate_and_compatibility_rejects_auto_map():
+    from mtplx.artifacts import ModelInspection
+    from mtplx.backends.registry import _passes_qwen4_exp_gate, compatibility_for_inspection
+
+    insp = ModelInspection(
+        model_dir="remote-org/custom-qwen4",
+        source="hf",
+        config_exists=True,
+        architecture="Qwen4ExpForConditionalGeneration",
+        model_type="qwen4_exp",
+        mtp_num_hidden_layers=0,
+        hidden_size=1024,
+        num_hidden_layers=12,
+        vocab_size=32000,
+        model_files=("model.safetensors",),
+        auto_map={"AutoModelForCausalLM": "custom_modeling.CustomModel"},
+        requires_remote_code=True,
+    )
+    assert not _passes_qwen4_exp_gate(insp)
+    verdict = compatibility_for_inspection(insp)
+    assert not verdict.can_run
+    assert verdict.runtime_compatibility == "trust-remote-code-required"
+
+
+def test_release_embedded_mtp_tensors_for_ar_only_loads():
+    from mtplx.models.qwen4_exp import Model, ModelArgs
+
+    args = ModelArgs.from_dict({
+        "model_type": "qwen4_exp",
+        "hidden_size": 64,
+        "num_hidden_layers": 1,
+        "num_attention_heads": 2,
+        "num_key_value_heads": 2,
+        "head_dim": 32,
+        "vocab_size": 100,
+        "layer_types": ["linear_attention"],
+        "hc_count": 1,
+        "hc_lowrank": 32,
+        "ple_layer_ids": [0],
+        "ngram_size": 2,
+        "ple_conv_kernel_size": 2,
+        "ple_embed_dim": 64,
+        "linear_num_key_heads": 2,
+        "linear_num_value_heads": 2,
+        "linear_key_head_dim": 32,
+        "linear_value_head_dim": 32,
+        "linear_conv_kernel_dim": 2,
+    })
+    model = Model(args)
+    raw_weights = {
+        "model.embed_tokens.weight": mx.ones((100, 64)),
+        "lm_head.weight": mx.ones((100, 64)),
+        "mtp.fc_embedding.weight": mx.ones((64, 64)),
+        "mtp.fc_hidden.weight": mx.ones((64, 64)),
+    }
+    sanitized = model.sanitize(raw_weights)
+    assert "mtp.fc_embedding.weight" not in sanitized
+    assert "mtp.fc_embedding.weight" in model.mtp_weights
+
+    # When AR-only load occurs, clearing mtp weights releases memory
+    model.clear_mtp_weights()
+    assert model.mtp_weights == {}
 
 
 

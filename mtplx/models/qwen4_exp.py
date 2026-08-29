@@ -662,8 +662,12 @@ class QSAIndexer(nn.Module):
             cos_k, sin_k = rope(block_starts[None, :])
             pooled = _rope_partial(pooled, cos_k, sin_k)
 
-        q_pos = mx.arange(offset, offset + S)
-        cos_q, sin_q = rope(q_pos[None, :])
+        if isinstance(offset, mx.array):
+            off_arr = offset.reshape(-1)
+            q_pos = off_arr[:, None] + mx.arange(S)[None, :]
+        else:
+            q_pos = mx.arange(offset, offset + S)
+        cos_q, sin_q = rope(q_pos if q_pos.ndim == 2 else q_pos[None, :])
         q = self.q_layernorm(q)
         q = _rope_partial(q, cos_q[:, :, None, :], sin_q[:, :, None, :])
         return QSAPrep(
@@ -686,15 +690,19 @@ class QSAIndexer(nn.Module):
         B, S, _, _ = q.shape
         n_blocks = int(pooled.shape[1])
         r = self.compress_ratio
-        n_complete = (q_pos + 1) // r
-        is_complete = mx.arange(n_blocks)[None, :] < n_complete[:, None]  # (S, n_blocks)
+        if q_pos.ndim == 2:
+            n_complete = (q_pos + 1) // r
+            is_complete = mx.arange(n_blocks)[None, None, :] < n_complete[:, :, None]
+        else:
+            n_complete = (q_pos + 1) // r
+            is_complete = (mx.arange(n_blocks)[None, :] < n_complete[:, None])[None, :, :]
 
         if left_padding is not None:
             block_ends = (mx.arange(n_blocks) + 1) * r  # (n_blocks,)
             is_not_pad = block_ends[None, None, :] > left_padding[:, None, None]  # (B, 1, n_blocks)
-            valid_block = is_complete[None, :, :] & is_not_pad  # (B, S, n_blocks)
+            valid_block = is_complete & is_not_pad  # (B, S, n_blocks)
         else:
-            valid_block = mx.broadcast_to(is_complete[None, :, :], (B, S, n_blocks))
+            valid_block = mx.broadcast_to(is_complete, (B, S, n_blocks))
 
         # Sum_h ReLU(<q_h, k_b>) without materializing the 4-head score tensor.
         acc = None
@@ -718,11 +726,16 @@ class QSAIndexer(nn.Module):
         if left_padding is not None:
             valid_blk = valid_blk & (tok >= left_padding[:, None, None])
 
-        tail_start = n_complete * r
-        tail = tail_start[:, None] + mx.arange(r)  # (S, r)
-        tail_valid = (tail <= q_pos[:, None]) & (tail < kv_len)
-        tail = mx.broadcast_to(tail[None], (B, S, r))
-        tail_valid = mx.broadcast_to(tail_valid[None], (B, S, r))
+        if q_pos.ndim == 2:
+            tail_start = n_complete * r
+            tail = tail_start[:, :, None] + mx.arange(r)
+            tail_valid = (tail <= q_pos[:, :, None]) & (tail < kv_len)
+        else:
+            tail_start = n_complete * r
+            tail = tail_start[:, None] + mx.arange(r)  # (S, r)
+            tail_valid = (tail <= q_pos[:, None]) & (tail < kv_len)
+            tail = mx.broadcast_to(tail[None], (B, S, r))
+            tail_valid = mx.broadcast_to(tail_valid[None], (B, S, r))
         if left_padding is not None:
             tail_valid = tail_valid & (tail >= left_padding[:, None, None])
 
@@ -838,7 +851,8 @@ class Attention(nn.Module):
         # mx.fast.rope has no amplitude scale; yarn (mscale != 1) takes the
         # cos/sin path where mscale is folded into the rotation.
         if (
-            freqs is not None
+            isinstance(offset, int)
+            and freqs is not None
             and dims is not None
             and float(getattr(rope, "mscale", 1.0) or 1.0) == 1.0
         ):
@@ -862,8 +876,14 @@ class Attention(nn.Module):
                 freqs=freqs,
             )
         else:
-            cos, sin = rope(mx.arange(offset, offset + S)[None])
-            cos, sin = cos[:, None], sin[:, None]
+            shift = int(getattr(rope, "position_shift", 0) or 0)
+            if isinstance(offset, mx.array):
+                off_arr = offset.reshape(-1) + shift
+                pos = off_arr[:, None] + mx.arange(S)[None, :]
+            else:
+                pos = mx.arange(offset + shift, offset + shift + S)[None, :]
+            cos, sin = rope(pos)
+            cos, sin = cos[:, None, :, :], sin[:, None, :, :]
             q, k = _rope_partial(q, cos, sin), _rope_partial(k, cos, sin)
 
         if cache is not None:
@@ -1946,6 +1966,29 @@ class _AttnCache(KVCache):
         self._mtplx_indexer_trim = True
 
     def update_and_fetch(self, keys: Any, values: Any) -> tuple[Any, Any]:
+        if isinstance(getattr(self, "offset", None), mx.array):
+            prev = int(self.keys.shape[2]) if self.keys is not None else 0
+            if self.keys is None or (prev + keys.shape[2]) > self.keys.shape[2]:
+                B, n_kv_heads, _, k_head_dim = keys.shape
+                v_head_dim = values.shape[3]
+                n_steps = (self.step + keys.shape[2] - 1) // self.step
+                k_shape = (B, n_kv_heads, n_steps * self.step, k_head_dim)
+                v_shape = (B, n_kv_heads, n_steps * self.step, v_head_dim)
+                new_k = mx.zeros(k_shape, keys.dtype)
+                new_v = mx.zeros(v_shape, values.dtype)
+                if self.keys is not None:
+                    if prev % self.step != 0:
+                        self.keys = self.keys[..., :prev, :]
+                        self.values = self.values[..., :prev, :]
+                    self.keys = mx.concatenate([self.keys, new_k], axis=2)
+                    self.values = mx.concatenate([self.values, new_v], axis=2)
+                else:
+                    self.keys, self.values = new_k, new_v
+            new_idx = prev + keys.shape[2]
+            self.keys[..., prev:new_idx, :] = keys
+            self.values[..., prev:new_idx, :] = values
+            self.offset = self.offset + keys.shape[2]
+            return self.keys[..., :new_idx, :], self.values[..., :new_idx, :]
         res = super().update_and_fetch(keys, values)
         if isinstance(res, tuple) and len(res) >= 2:
             return res[0], res[1]
@@ -2085,7 +2128,17 @@ class _AttnCache(KVCache):
         k2_pad, v2_pad = pad_kv(other_k, other_v, b_batch, L2)
         self.keys = mx.concatenate([k1_pad, k2_pad], axis=0)
         self.values = mx.concatenate([v1_pad, v2_pad], axis=0)
-        self.offset = max_L
+        a_off = (
+            self.offset.astype(mx.int32).reshape(-1)
+            if isinstance(getattr(self, "offset", None), mx.array)
+            else mx.full((a_batch,), int(getattr(self, "offset", L1)), dtype=mx.int32)
+        )
+        b_off = (
+            other.offset.astype(mx.int32).reshape(-1)
+            if isinstance(getattr(other, "offset", None), mx.array)
+            else mx.full((b_batch,), int(getattr(other, "offset", L2)), dtype=mx.int32)
+        )
+        self.offset = mx.concatenate([a_off, b_off], axis=0)
 
         other_lp = getattr(other, "left_padding", None)
         if getattr(self, "left_padding", None) is not None or other_lp is not None:
@@ -2614,6 +2667,9 @@ class Model(nn.Module):
     @property
     def mtp_weights(self) -> Dict[str, Any]:
         return getattr(self, "_mtp_weights", {})
+
+    def clear_mtp_weights(self) -> None:
+        self._mtp_weights = {}
 
     def __call__(
         self,

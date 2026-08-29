@@ -1214,6 +1214,8 @@ def _passes_qwen4_exp_gate(inspection: Any) -> bool:
             return False
     if not has_trunk:
         return False
+    if _requires_remote_code(model_dir, inspection=inspection):
+        return False
     return _unsupported_quant_bits(model_dir, inspection=inspection) is None
 
 
@@ -1255,6 +1257,8 @@ def _passes_mlx_lm_ar_gate(inspection: Any) -> bool:
         except OSError:
             return False
     if not has_trunk:
+        return False
+    if _requires_remote_code(model_dir, inspection=inspection):
         return False
     return _unsupported_quant_bits(model_dir, inspection=inspection) is None
 
@@ -1322,7 +1326,7 @@ def _unsupported_quant_bits(
     return None
 
 
-def _requires_remote_code(model_dir: Any) -> bool:
+def _requires_remote_code(model_dir: Any, inspection: Any = None) -> bool:
     """True when loading needs transformers to execute repository code.
 
     MTPLX never passes trust_remote_code: a checkpoint whose config or
@@ -1330,6 +1334,18 @@ def _requires_remote_code(model_dir: Any) -> bool:
     in the repo) cannot be loaded under this policy, whatever the weights
     look like.
     """
+    if inspection is not None:
+        if getattr(inspection, "requires_remote_code", False):
+            return True
+        if getattr(inspection, "auto_map", None):
+            return True
+        cfg = getattr(inspection, "config", None)
+        if isinstance(cfg, dict):
+            if isinstance(cfg.get("auto_map"), dict) and cfg.get("auto_map"):
+                return True
+            tcfg = cfg.get("text_config")
+            if isinstance(tcfg, dict) and isinstance(tcfg.get("auto_map"), dict) and tcfg.get("auto_map"):
+                return True
     for name in ("config.json", "tokenizer_config.json"):
         try:
             data = json.loads(
@@ -1410,7 +1426,7 @@ def compatibility_for_inspection(inspection: Any) -> CompatibilityVerdict:
     contract_path = getattr(inspection, "runtime_contract_path", None)
     if not contract_path:
         contract_path = str(_contract_path(model_dir)) if _contract_path(model_dir).exists() else None
-    if _requires_remote_code(model_dir):
+    if _requires_remote_code(model_dir, inspection=inspection):
         support = architecture_support_for(detected_arch_id)
         return CompatibilityVerdict(
             tier=TIER_ARCH_COMPATIBLE_UNVERIFIED,
