@@ -2626,6 +2626,65 @@ def test_loaded_weights_bytes_deduplicates_and_ignores_unused_adapters(tmp_path)
     assert loaded_bytes == 3000
 
 
+def test_attn_cache_extract_slices_to_active_offset():
+    from mtplx.models.qwen4_exp import _AttnCache
+
+    c = _AttnCache()
+    # Allocated buffer has 256 slots, but offset is only 16
+    c.keys = mx.ones((2, 2, 256, 32))
+    c.values = mx.ones((2, 2, 256, 32))
+    c.offset = 16
+    c.left_padding = mx.array([2, 4])
+
+    extracted = c.extract(0)
+    assert extracted.keys.shape == (1, 2, 16, 32)
+    assert extracted.values.shape == (1, 2, 16, 32)
+    assert extracted.offset == 16
+    assert int(extracted.left_padding[0].item()) == 2
+
+
+def test_attn_cache_and_indexer_extend_aligns_differing_histories_and_paddings():
+    from mtplx.models.qwen4_exp import _AttnCache, _IndexerCache
+
+    c1 = _AttnCache()
+    c1.keys = mx.ones((1, 2, 8, 32))
+    c1.values = mx.ones((1, 2, 8, 32))
+    c1.offset = 8
+    c1.left_padding = mx.array([2])
+    c1.indexer = _IndexerCache()
+    c1.indexer.update(mx.ones((1, 8, 64)))
+    c1.indexer.left_padding = c1.left_padding
+
+    c2 = _AttnCache()
+    c2.keys = mx.ones((1, 2, 4, 32)) * 2
+    c2.values = mx.ones((1, 2, 4, 32)) * 2
+    c2.offset = 4
+    c2.left_padding = mx.array([0])
+    c2.indexer = _IndexerCache()
+    c2.indexer.update(mx.ones((1, 4, 64)) * 2)
+    c2.indexer.left_padding = c2.left_padding
+
+    c1.extend(c2)
+
+    # Both rows aligned to max_L = 8
+    assert c1.keys.shape == (2, 2, 8, 32)
+    assert c1.values.shape == (2, 2, 8, 32)
+    assert c1.offset == 8
+    # c2 was padded on the left by 4, so its left_padding becomes 0 + 4 = 4
+    assert list(c1.left_padding.tolist()) == [2, 4]
+
+    # Row 1 (c2) should have 4 zeros prepended and then the 4 original tokens
+    assert float(c1.keys[1, :, :4, :].abs().max().item()) == 0.0
+    assert float(c1.keys[1, :, 4:, :].mean().item()) == 2.0
+
+    # Indexer buffer should also be aligned
+    assert c1.indexer.keys.shape == (2, 8, 64)
+    assert list(c1.indexer.left_padding.tolist()) == [2, 4]
+    assert float(c1.indexer.keys[1, :4, :].abs().max().item()) == 0.0
+    assert float(c1.indexer.keys[1, 4:, :].mean().item()) == 2.0
+
+
+
 
 
 

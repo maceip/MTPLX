@@ -1865,6 +1865,10 @@ class _IndexerCache(_BaseCache):
                 if other_lp is not None
                 else mx.zeros((b_batch,), dtype=mx.int32)
             )
+            if L1 < max_L:
+                a_lp = a_lp + (max_L - L1)
+            if L2 < max_L:
+                b_lp = b_lp + (max_L - L2)
             self.left_padding = mx.concatenate([a_lp, b_lp], axis=0)
         self.pooled = None
 
@@ -1998,17 +2002,91 @@ class _AttnCache(KVCache):
     def extend(self, other: Any) -> None:
         if other is None:
             return
-        a_batch = self.keys.shape[0] if self.keys is not None else 1
-        b_batch = other.keys.shape[0] if getattr(other, "keys", None) is not None else 1
-        if self.keys is None and getattr(other, "keys", None) is None:
-            pass
-        elif self.keys is None:
-            self.keys = other.keys
-            self.values = other.values
-            self.offset = getattr(other, "offset", 0)
-        elif getattr(other, "keys", None) is not None:
-            self.keys = mx.concatenate([self.keys, other.keys], axis=0)
-            self.values = mx.concatenate([self.values, other.values], axis=0)
+        self_k = self.keys
+        self_v = self.values
+        other_k = getattr(other, "keys", None)
+        other_v = getattr(other, "values", None)
+        if self_k is None and other_k is None:
+            return
+
+        a_batch = self_k.shape[0] if self_k is not None else 1
+        b_batch = other_k.shape[0] if other_k is not None else 1
+
+        off1 = (
+            int(self.offset.max().item())
+            if isinstance(getattr(self, "offset", None), mx.array)
+            else int(getattr(self, "offset", 0))
+        )
+        if self_k is not None:
+            L1 = off1 if off1 > 0 else self_k.shape[2]
+            L1 = min(L1, self_k.shape[2])
+            self_k = self_k[..., :L1, :]
+            self_v = self_v[..., :L1, :]
+        else:
+            L1 = 0
+
+        off2 = (
+            int(other.offset.max().item())
+            if isinstance(getattr(other, "offset", None), mx.array)
+            else int(getattr(other, "offset", 0))
+        )
+        if other_k is not None:
+            L2 = off2 if off2 > 0 else other_k.shape[2]
+            L2 = min(L2, other_k.shape[2])
+            other_k = other_k[..., :L2, :]
+            other_v = other_v[..., :L2, :]
+        else:
+            L2 = 0
+
+        max_L = max(L1, L2)
+        if max_L == 0:
+            return
+
+        H = (
+            self_k.shape[1]
+            if self_k is not None
+            else (other_k.shape[1] if other_k is not None else 1)
+        )
+        Dk = (
+            self_k.shape[3]
+            if self_k is not None
+            else (other_k.shape[3] if other_k is not None else 128)
+        )
+        Dv = (
+            self_v.shape[3]
+            if self_v is not None
+            else (other_v.shape[3] if other_v is not None else 128)
+        )
+        dt_k = (
+            self_k.dtype
+            if self_k is not None
+            else (other_k.dtype if other_k is not None else mx.float32)
+        )
+        dt_v = (
+            self_v.dtype
+            if self_v is not None
+            else (other_v.dtype if other_v is not None else mx.float32)
+        )
+
+        def pad_kv(k, v, batch, cur_len):
+            if k is None:
+                return (
+                    mx.zeros((batch, H, max_L, Dk), dtype=dt_k),
+                    mx.zeros((batch, H, max_L, Dv), dtype=dt_v),
+                )
+            if cur_len < max_L:
+                pad = max_L - cur_len
+                k_pad = mx.concatenate([mx.zeros((batch, H, pad, Dk), dtype=dt_k), k], axis=2)
+                v_pad = mx.concatenate([mx.zeros((batch, H, pad, Dv), dtype=dt_v), v], axis=2)
+                return k_pad, v_pad
+            return k, v
+
+        k1_pad, v1_pad = pad_kv(self_k, self_v, a_batch, L1)
+        k2_pad, v2_pad = pad_kv(other_k, other_v, b_batch, L2)
+        self.keys = mx.concatenate([k1_pad, k2_pad], axis=0)
+        self.values = mx.concatenate([v1_pad, v2_pad], axis=0)
+        self.offset = max_L
+
         other_lp = getattr(other, "left_padding", None)
         if getattr(self, "left_padding", None) is not None or other_lp is not None:
             a_lp = (
@@ -2021,24 +2099,23 @@ class _AttnCache(KVCache):
                 if other_lp is not None
                 else mx.zeros((b_batch,), dtype=mx.int32)
             )
+            if L1 < max_L:
+                a_lp = a_lp + (max_L - L1)
+            if L2 < max_L:
+                b_lp = b_lp + (max_L - L2)
             self.left_padding = mx.concatenate([a_lp, b_lp], axis=0)
+
         other_len = getattr(other, "lengths", None)
         if getattr(self, "lengths", None) is not None or other_len is not None:
             a_len = (
                 self.lengths
                 if getattr(self, "lengths", None) is not None
-                else mx.zeros(
-                    (a_batch,),
-                    dtype=mx.int32,
-                )
+                else mx.full((a_batch,), L1, dtype=mx.int32)
             )
             b_len = (
                 other_len
                 if other_len is not None
-                else mx.zeros(
-                    (b_batch,),
-                    dtype=mx.int32,
-                )
+                else mx.full((b_batch,), L2, dtype=mx.int32)
             )
             self.lengths = mx.concatenate([a_len, b_len], axis=0)
         if (
@@ -2047,13 +2124,21 @@ class _AttnCache(KVCache):
             and hasattr(self.indexer, "extend")
         ):
             self.indexer.extend(getattr(other, "indexer", None))
+            if getattr(self, "left_padding", None) is not None:
+                self.indexer.left_padding = self.left_padding
 
     def extract(self, idx: int) -> "_AttnCache":
         cache = _AttnCache()
         if self.keys is not None:
-            cache.keys = mx.contiguous(self.keys[idx : idx + 1])
-            cache.values = mx.contiguous(self.values[idx : idx + 1])
-            cache.offset = cache.keys.shape[2]
+            off = (
+                int(self.offset[idx].item())
+                if isinstance(getattr(self, "offset", None), mx.array)
+                else int(getattr(self, "offset", self.keys.shape[2]))
+            )
+            off = min(off, self.keys.shape[2])
+            cache.keys = mx.contiguous(self.keys[idx : idx + 1, :, :off, :])
+            cache.values = mx.contiguous(self.values[idx : idx + 1, :, :off, :])
+            cache.offset = off
         if getattr(self, "left_padding", None) is not None:
             cache.left_padding = self.left_padding[idx : idx + 1]
         if getattr(self, "lengths", None) is not None:
