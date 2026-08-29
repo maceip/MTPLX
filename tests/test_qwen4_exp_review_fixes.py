@@ -2804,6 +2804,82 @@ def test_release_embedded_mtp_tensors_for_ar_only_loads():
     assert model.mtp_weights == {}
 
 
+def test_qwen4_exp_recurrent_cache_merge_preserves_padding_metadata():
+    from mtplx.qwen4_exp_mtp_patch import Qwen4ExpRecurrentCache
+
+    c1 = Qwen4ExpRecurrentCache(4)
+    c1[0] = mx.ones((1, 32, 4))
+    c1[1] = mx.ones((1, 4, 32, 32))
+    c1.left_padding = mx.array([0], dtype=mx.int32)
+    c1.lengths = mx.array([8], dtype=mx.int32)
+
+    c2 = Qwen4ExpRecurrentCache(4)
+    c2[0] = mx.ones((1, 32, 4)) * 2
+    c2[1] = mx.ones((1, 4, 32, 32)) * 2
+    c2.left_padding = mx.array([4], dtype=mx.int32)
+    c2.lengths = mx.array([4], dtype=mx.int32)
+
+    merged = Qwen4ExpRecurrentCache.merge([c1, c2])
+    assert merged[0].shape == (2, 32, 4)
+    assert merged[1].shape == (2, 4, 32, 32)
+    assert merged.left_padding is not None
+    assert list(merged.left_padding.tolist()) == [0, 4]
+    assert merged.lengths is not None
+    assert list(merged.lengths.tolist()) == [8, 4]
+
+    # make_mask should return (2, 8) boolean mask
+    mask = merged.make_mask(8)
+    assert mask is not None
+    assert mask.shape == (2, 8)
+    # Row 0: pos >= 0 -> all True
+    assert list(mask[0].tolist()) == [True] * 8
+    # Row 1: pos >= 4 -> first 4 False, next 4 True
+    assert list(mask[1].tolist()) == [False, False, False, False, True, True, True, True]
+
+
+def test_qsa_indexer_chunked_select_with_vector_q_pos(monkeypatch):
+    from mtplx.models.qwen4_exp import Attention, QSAIndexer, TextArgs, _AttnCache
+
+    args = TextArgs(
+        hidden_size=64,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        head_dim=32,
+        indexer_n_heads=2,
+        indexer_kv_heads=1,
+        indexer_head_dim=32,
+        indexer_budget=8,
+        indexer_compress_ratio=4,
+        layer_types=["full_attention"],
+    )
+    indexer = QSAIndexer(args)
+    attn = Attention(args)
+
+    # Set small query chunk to force multiple chunks (e.g. S=6 > chunk=2)
+    import mtplx.models.qwen4_exp as qmod
+    monkeypatch.setattr(qmod, "_qsa_query_chunk", lambda: 2)
+
+    # Vector offset from merged cache: e.g. row 0 has offset 8, row 1 has offset 4
+    cache = _AttnCache()
+    cache.keys = mx.ones((2, 2, 8, 32))
+    cache.values = mx.ones((2, 2, 8, 32))
+    cache.offset = mx.array([8, 4], dtype=mx.int32)
+    cache.indexer.update(mx.ones((2, 8, 32)))
+
+    # Warm multi-token forward: S=6
+    x = mx.ones((2, 6, 64))
+    rope = attn.rope
+
+    sel = indexer(x, rope, cache.indexer, cache.offset)
+    assert sel is not None
+    assert sel.token_idx.shape[0] == 2
+    assert sel.token_idx.shape[1] == 6
+
+    # Full attention forward with chunking
+    out = attn(x, cache=cache)
+    assert out.shape == (2, 6, 64)
+
+
 
 
 

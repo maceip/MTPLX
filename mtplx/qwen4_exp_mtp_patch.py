@@ -842,6 +842,35 @@ class Qwen4ExpRecurrentCache:
                 if caches[i][e] is None:
                     continue
                 cache[e][i : i + 1] = caches[i][e]
+
+        lps = [getattr(c, "left_padding", None) for c in caches]
+        if any(lp is not None for lp in lps):
+            lp_list = []
+            for c in caches:
+                b = getattr(c, "batch_size", 1)
+                c_lp = getattr(c, "left_padding", None)
+                if c_lp is not None:
+                    lp_list.append(
+                        c_lp if isinstance(c_lp, mx.array) else mx.array(c_lp, dtype=mx.int32)
+                    )
+                else:
+                    lp_list.append(mx.zeros((b,), dtype=mx.int32))
+            cache.left_padding = mx.concatenate(lp_list, axis=0)
+
+        lens = [getattr(c, "lengths", None) for c in caches]
+        if any(l is not None for l in lens):
+            len_list = []
+            for c in caches:
+                b = getattr(c, "batch_size", 1)
+                c_len = getattr(c, "lengths", None)
+                if c_len is not None:
+                    len_list.append(
+                        c_len if isinstance(c_len, mx.array) else mx.array(c_len, dtype=mx.int32)
+                    )
+                else:
+                    len_list.append(mx.zeros((b,), dtype=mx.int32))
+            cache.lengths = mx.concatenate(len_list, axis=0)
+
         return cache
 
     @property

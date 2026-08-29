@@ -760,10 +760,13 @@ class QSAIndexer(nn.Module):
         parts: List[QSASelection] = []
         for s0 in range(0, S, chunk):
             s1 = min(s0 + chunk, S)
+            q_pos_slice = (
+                prep.q_pos[:, s0:s1] if prep.q_pos.ndim == 2 else prep.q_pos[s0:s1]
+            )
             parts.append(
                 self.select(
                     prep.q[:, s0:s1],
-                    prep.q_pos[s0:s1],
+                    q_pos_slice,
                     prep.pooled,
                     prep.kv_len,
                     prep.left_padding,
@@ -930,9 +933,14 @@ class Attention(nn.Module):
                 pieces: List[mx.array] = []
                 for s0 in range(0, S, chunk):
                     s1 = min(s0 + chunk, S)
+                    q_pos_slice = (
+                        prep.q_pos[:, s0:s1]
+                        if prep.q_pos.ndim == 2
+                        else prep.q_pos[s0:s1]
+                    )
                     sel = indexer.select(
                         prep.q[:, s0:s1],
-                        prep.q_pos[s0:s1],
+                        q_pos_slice,
                         prep.pooled,
                         prep.kv_len,
                         prep.left_padding,
