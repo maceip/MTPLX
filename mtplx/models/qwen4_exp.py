@@ -1796,6 +1796,13 @@ class _IndexerCache(_BaseCache):
             self._buf = self._buf[batch_indices]
         if self.left_padding is not None:
             self.left_padding = self.left_padding[batch_indices]
+            if getattr(self.left_padding, "size", 0) > 0:
+                min_left_pad = int(self.left_padding.min().item())
+                if min_left_pad > 0:
+                    if self._buf is not None:
+                        self._buf = self._buf[:, min_left_pad:, :]
+                    self._len = max(0, self._len - min_left_pad)
+                    self.left_padding -= min_left_pad
         self.pooled = None
 
     def extend(self, other: Any) -> None:
@@ -1954,6 +1961,22 @@ class _AttnCache(KVCache):
             self.lengths = self.lengths[batch_indices]
         if getattr(self, "_lengths", None) is not None:
             self._lengths = self._lengths[batch_indices]
+
+        if getattr(self, "left_padding", None) is not None and getattr(self.left_padding, "size", 0) > 0:
+            min_left_pad = int(self.left_padding.min().item())
+            if min_left_pad > 0:
+                if self.keys is not None:
+                    self.keys = self.keys[..., min_left_pad:, :]
+                    self.values = self.values[..., min_left_pad:, :]
+                if getattr(self, "offset", None) is not None:
+                    if isinstance(self.offset, mx.array):
+                        self.offset -= min_left_pad
+                    elif isinstance(self.offset, (int, float)):
+                        self.offset = max(0, int(self.offset) - min_left_pad)
+                if hasattr(self, "_idx"):
+                    self._idx = max(0, self._idx - min_left_pad)
+                self.left_padding -= min_left_pad
+
         if (
             hasattr(self, "indexer")
             and self.indexer is not None

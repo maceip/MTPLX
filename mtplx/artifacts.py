@@ -346,7 +346,11 @@ def text_config(config: dict[str, Any]) -> dict[str, Any]:
     return config.get("text_config", config)
 
 
-def expected_mtp_file(model_dir: Path | str, config: dict[str, Any] | None = None) -> Path:
+def expected_mtp_file(
+    model_dir: Path | str,
+    config: dict[str, Any] | None = None,
+    files: Any | None = None,
+) -> Path:
     model_path = Path(model_dir)
     if config is None:
         try:
@@ -356,12 +360,29 @@ def expected_mtp_file(model_dir: Path | str, config: dict[str, Any] | None = Non
     extra = config.get("mlx_lm_extra_tensors", {}) if isinstance(config, dict) else {}
     if isinstance(extra, dict) and extra.get("mtp_file"):
         return model_path / str(extra["mtp_file"])
-    for rel in (
+    candidates = (
         "mtp.safetensors",
         "mtp/weights.safetensors",
         "model-mtp.safetensors",
         "model-mtp-head.safetensors",
-    ):
+    )
+    if files is not None:
+        file_set = {str(f).lstrip("./") for f in files}
+        for rel in candidates:
+            if rel in file_set:
+                return model_path / rel
+        for f in sorted(file_set):
+            fname = Path(f).name.lower()
+            if (
+                fname == "mtp.safetensors"
+                or fname == "model-mtp.safetensors"
+                or fname == "model-mtp-head.safetensors"
+                or fname.endswith("-mtp.safetensors")
+                or fname.endswith("-mtp-head.safetensors")
+                or (fname == "weights.safetensors" and Path(f).parent.name.lower() == "mtp")
+            ):
+                return model_path / f
+    for rel in candidates:
         candidate = model_path / rel
         if candidate.exists():
             return candidate
@@ -1039,7 +1060,7 @@ def _inspect_hf_model(repo_id: str) -> ModelInspection:
             if Path(name).name.startswith("model") and name.endswith(".safetensors")
         )
     )
-    mtp_file = str(expected_mtp_file(Path("."), config))
+    mtp_file = str(expected_mtp_file(Path("."), config, files=files))
     if mtp_file.startswith("./"):
         mtp_file = mtp_file[2:]
     mtp_file = mtp_file.lstrip("/")

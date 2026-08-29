@@ -1727,9 +1727,12 @@ def test_attn_cache_filters_left_padding_and_lengths():
     c_multi.keys = mx.ones((2, 2, 8, 32))
     c_multi.values = mx.ones((2, 2, 8, 32))
     c_multi.left_padding = mx.array([2, 4])
+    c_multi.offset = 8
     c_multi.filter(mx.array([1]))
     assert c_multi.keys.shape[0] == 1
-    assert int(c_multi.left_padding[0].item()) == 4
+    assert c_multi.keys.shape[2] == 4
+    assert int(c_multi.left_padding[0].item()) == 0
+    assert int(c_multi.offset) == 4
 
     # Extract
     c1_ext = c1.extract(0)
@@ -2471,6 +2474,52 @@ def test_qwen4_server_applies_family_sampler_defaults(monkeypatch):
     assert args2.temperature == 0.7
     state2 = openai.ServerState(args2)
     assert state2.args.temperature == 0.7
+
+
+def test_expected_mtp_file_selects_from_remote_files_list(tmp_path):
+    from mtplx.artifacts import expected_mtp_file, _inspect_hf_model
+
+    remote_files = [
+        "config.json",
+        "model-00001-of-00002.safetensors",
+        "model-00002-of-00002.safetensors",
+        "model-mtp-head.safetensors",
+    ]
+    # Without files argument and nonexistent local dir, falls back to default mtp.safetensors
+    res_default = expected_mtp_file(tmp_path / "nonexistent", config={})
+    assert res_default.name == "mtp.safetensors"
+
+    # With remote files list, picks model-mtp-head.safetensors
+    res_remote = expected_mtp_file(Path("."), config={}, files=remote_files)
+    assert res_remote.name == "model-mtp-head.safetensors"
+
+
+def test_attn_cache_and_indexer_rebase_padding_on_filter():
+    from mtplx.models.qwen4_exp import _AttnCache, _IndexerCache
+
+    c = _AttnCache()
+    c.keys = mx.ones((3, 2, 10, 32))
+    c.values = mx.ones((3, 2, 10, 32))
+    c.left_padding = mx.array([3, 5, 7])
+    c.offset = 10
+
+    # Indexer buffer with length 10
+    c.indexer = _IndexerCache()
+    c.indexer.update(mx.ones((3, 10, 64)))
+    c.indexer.left_padding = c.left_padding
+
+    # Filter to retain rows [1, 2] (padding 5 and 7). Shared minimum padding is 5.
+    c.filter(mx.array([1, 2]))
+
+    assert c.keys.shape[0] == 2
+    assert c.keys.shape[2] == 5  # 10 - 5
+    assert list(c.left_padding.tolist()) == [0, 2]  # [5-5, 7-5]
+    assert int(c.offset) == 5  # 10 - 5
+
+    assert c.indexer.keys.shape[0] == 2
+    assert c.indexer.keys.shape[1] == 5
+    assert list(c.indexer.left_padding.tolist()) == [0, 2]
+
 
 
 
