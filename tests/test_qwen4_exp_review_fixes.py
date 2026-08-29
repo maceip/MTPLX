@@ -2521,6 +2521,112 @@ def test_attn_cache_and_indexer_rebase_padding_on_filter():
     assert list(c.indexer.left_padding.tolist()) == [0, 2]
 
 
+def test_passes_qwen4_exp_gate_preserves_remote_weights_safetensors():
+    from mtplx.backends.registry import _passes_qwen4_exp_gate
+    from types import SimpleNamespace
+
+    # Remote HF model inspection with top-level weights.safetensors as trunk
+    inspection = SimpleNamespace(
+        source="hf",
+        model_dir="Qwen/Qwen3.8-Flash-Next",
+        model_type="qwen4_exp",
+        architecture="Qwen4ExpForConditionalGeneration",
+        model_files=("config.json", "weights.safetensors"),
+        weight_keys=(),
+    )
+    assert _passes_qwen4_exp_gate(inspection) is True
+
+
+def test_shift_trunk_gemma_norms_uses_primary_markers():
+    import pytest
+    from mtplx.models.qwen4_exp import _shift_trunk_gemma_norms
+
+    # Raw HF trunk where q_norm has high average (e.g. 0.9) but hc_norm is raw 0.0
+    weights = {
+        "model.layers.0.linear_attn.q_norm.weight": mx.full((64,), 0.9),
+        "model.layers.0.linear_attn.k_norm.weight": mx.full((64,), 0.9),
+        "model.layers.0.hc_norm.weight": mx.zeros((64,)),
+        "model.norm.weight": mx.zeros((64,)),
+    }
+    shifted = _shift_trunk_gemma_norms(weights)
+    # Since primary marker hc_norm is 0.0, +1.0 should be applied
+    assert float(shifted["model.layers.0.hc_norm.weight"].mean().item()) == pytest.approx(1.0)
+    assert float(shifted["model.norm.weight"].mean().item()) == pytest.approx(1.0)
+    assert float(shifted["model.layers.0.linear_attn.q_norm.weight"].mean().item()) == pytest.approx(1.9)
+
+
+def test_ple_layer_excludes_left_padding_tokens():
+    from mtplx.models.qwen4_exp import PLELayer, TextArgs
+
+    args = TextArgs(
+        model_type="qwen4_exp",
+        hidden_size=64,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        vocab_size=1000,
+        eos_token_id=0,
+        ngram_size=3,
+        heads_per_ngram=2,
+        ple_embed_dim=32,
+        ple_conv_kernel_size=3,
+        hc_count=2,
+    )
+    ple = PLELayer(args, ple_layer_index=0)
+    hidden = mx.ones((1, 4, 64 * 2))
+    prev_ctx = mx.zeros((1, 2), dtype=mx.int32)
+    # IDs with 2 padding tokens (value 999) and 2 valid tokens (101, 102)
+    ids_padded = mx.array([[999, 999, 101, 102]], dtype=mx.int32)
+    mask = mx.array([[False, False, True, True]])
+
+    # IDs without padding tokens
+    ids_clean = mx.array([[0, 0, 101, 102]], dtype=mx.int32)
+
+    out_padded = ple(hidden, ids_padded, prev_ctx, cache=None, mask=mask)
+    out_clean = ple(hidden, ids_clean, prev_ctx, cache=None, mask=mask)
+
+    # Valid token outputs at indices 2 and 3 should match exactly
+    assert mx.allclose(out_padded[:, 2:], out_clean[:, 2:]).item()
+    # Padded token outputs at indices 0 and 1 are 0
+    assert float(out_padded[:, :2].abs().max().item()) == 0.0
+
+
+def test_loaded_weights_bytes_deduplicates_and_ignores_unused_adapters(tmp_path):
+    import json
+    from mtplx.server.openai import _loaded_weights_bytes_for_model_path
+
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+
+    # Create real model shard 1 (1000 bytes) and shard 2 (2000 bytes)
+    shard1 = model_dir / "model-00001-of-00002.safetensors"
+    shard1.write_bytes(b"x" * 1000)
+    shard2 = model_dir / "model-00002-of-00002.safetensors"
+    shard2.write_bytes(b"y" * 2000)
+
+    # Create unused adapter file (5000 bytes)
+    adapter = model_dir / "adapter_model.safetensors"
+    adapter.write_bytes(b"z" * 5000)
+
+    # Create duplicate symlink to shard 1 (1000 bytes)
+    symlink = model_dir / "model-00001-symlink.safetensors"
+    symlink.symlink_to(shard1)
+
+    # Create index pointing only to shard1 and shard2
+    index = {
+        "weight_map": {
+            "model.embed.weight": "model-00001-of-00002.safetensors",
+            "model.layers.0.weight": "model-00002-of-00002.safetensors",
+        }
+    }
+    (model_dir / "model.safetensors.index.json").write_text(json.dumps(index))
+
+    # _loaded_weights_bytes_for_model_path should equal 1000 + 2000 = 3000 bytes
+    loaded_bytes = _loaded_weights_bytes_for_model_path(model_dir)
+    assert loaded_bytes == 3000
+
+
+
 
 
 

@@ -1057,7 +1057,7 @@ def _inspect_hf_model(repo_id: str) -> ModelInspection:
         sorted(
             name
             for name in files
-            if Path(name).name.startswith("model") and name.endswith(".safetensors")
+            if name.endswith(".safetensors")
         )
     )
     mtp_file = str(expected_mtp_file(Path("."), config, files=files))

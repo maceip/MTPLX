@@ -1672,19 +1672,81 @@ def _resident_headroom_bytes_for_weights(weights_bytes: int) -> int:
     )
 
 
-def _minimum_resident_bytes_for_model_path(model_path: str | None) -> int | None:
-    """Disk shard bytes + activation headroom, or None when unknown."""
-
+def _loaded_weights_bytes_for_model_path(model_path: str | Path | None) -> int | None:
+    """Total bytes of the model shards and enabled sidecars actually loaded,
+    deduplicating resolved paths and excluding unused adapters/alternate files.
+    """
     if not model_path:
         return None
     try:
-        from mtplx.engine_session import model_weights_bytes
+        root = Path(str(model_path))
+        if not root.is_dir():
+            return None
+
+        resolved_shards: set[Path] = set()
+
+        # 1. Checkpoint index-based resolution
+        index_path = root / "model.safetensors.index.json"
+        if index_path.exists():
+            try:
+                index_data = json.loads(index_path.read_text(encoding="utf-8"))
+                weight_map = index_data.get("weight_map", {})
+                if isinstance(weight_map, dict):
+                    for shard_name in set(weight_map.values()):
+                        shard_path = (root / shard_name).resolve()
+                        if shard_path.is_file():
+                            resolved_shards.add(shard_path)
+            except Exception:
+                pass
+
+        # 2. Sidecar resolution
+        try:
+            from mtplx.artifacts import expected_mtp_file, load_config
+
+            cfg = None
+            try:
+                cfg = load_config(root)
+            except Exception:
+                cfg = {}
+            mtp_file = expected_mtp_file(root, cfg)
+            if mtp_file and mtp_file.exists():
+                resolved_shards.add(mtp_file.resolve())
+        except Exception:
+            pass
+
+        # 3. If no index found, look for direct trunk shards
+        if not resolved_shards:
+            for candidate in ("model.safetensors", "weights.safetensors"):
+                p = (root / candidate).resolve()
+                if p.is_file():
+                    resolved_shards.add(p)
+            if not resolved_shards:
+                for p in root.glob("*.safetensors"):
+                    resolved = p.resolve()
+                    if resolved.is_file():
+                        resolved_shards.add(resolved)
+
+        if not resolved_shards:
+            from mtplx.engine_session import model_weights_bytes
+
+            return model_weights_bytes(root)
+
+        total = 0
+        for shard in resolved_shards:
+            try:
+                total += shard.stat().st_size
+            except OSError:
+                pass
+        return total if total > 0 else None
     except Exception:
         return None
-    try:
-        weights = model_weights_bytes(model_path)
-    except Exception:
+
+
+def _minimum_resident_bytes_for_model_path(model_path: str | None) -> int | None:
+    """Disk shard bytes + activation headroom, or None when unknown."""
+    if not model_path:
         return None
+    weights = _loaded_weights_bytes_for_model_path(model_path)
     if not weights:
         return None
     weights_int = int(weights)

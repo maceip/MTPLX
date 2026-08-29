@@ -1470,7 +1470,16 @@ class PLELayer(nn.Module):
         cache: Any,
         mask: Any = None,
     ) -> mx.array:
-        emb = self.ple_embedding(ids, prev_ctx).astype(hidden.dtype)
+        clean_ids = ids
+        if mask is not None and ids is not None:
+            m = mask
+            while m.ndim > ids.ndim:
+                m = m.squeeze(1)
+            if m.ndim < ids.ndim:
+                m = mx.broadcast_to(m, ids.shape)
+            eos = getattr(self.ple_embedding, "eos_token_id", 151643)
+            clean_ids = mx.where(m, ids, eos)
+        emb = self.ple_embedding(clean_ids, prev_ctx).astype(hidden.dtype)
         key = self.norm_key(self.key_proj(emb))
         key = key.reshape(*key.shape[:-1], self.hc, self.d)
         value = self.value_proj(emb)
@@ -2389,12 +2398,31 @@ def _shift_trunk_gemma_norms(weights: Dict[str, Any]) -> Dict[str, Any]:
     ]
     if not targets:
         return weights
-    try:
-        means = [float(v.mean().item()) for _, v in targets]
-        if sum(means) / len(means) > 0.5:
+
+    # Check primary raw trunk norm markers (e.g. hc_norm, model.norm, norm)
+    # instead of letting unrelated norm magnitudes (like trained q/k norms)
+    # skew the mean.
+    primary_markers = [
+        (k, v)
+        for k, v in targets
+        if str(k).endswith("hc_norm.weight")
+        or str(k).endswith("model.norm.weight")
+        or str(k) == "norm.weight"
+    ]
+    if primary_markers:
+        try:
+            marker_means = [float(v.mean().item()) for _, v in primary_markers]
+            if sum(marker_means) / len(marker_means) > 0.5:
+                return weights
+        except Exception:
             return weights
-    except Exception:
-        return weights
+    else:
+        try:
+            means = [float(v.mean().item()) for _, v in targets]
+            if sum(means) / len(means) > 0.5:
+                return weights
+        except Exception:
+            return weights
 
     out = dict(weights)
     for k, v in targets:
