@@ -2457,6 +2457,7 @@ def test_qwen4_server_applies_family_sampler_defaults(monkeypatch):
     monkeypatch.setattr(openai, "_fast_path_env_status", lambda *args, **kwargs: {})
     monkeypatch.setattr(openai, "_mlx_runtime_status", lambda *args, **kwargs: {"ok": True})
     monkeypatch.setattr(openai, "profile_env_status", lambda *args, **kwargs: {})
+    monkeypatch.setattr(openai, "apply_profile_env", lambda *args, **kwargs: None)
     monkeypatch.setattr(openai, "_apply_chat_template_profile", lambda *args, **kwargs: {"profile": "tokenizer"})
 
     # 1. Without explicit temperature: default 0.6 is updated to family default 1.0
