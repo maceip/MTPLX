@@ -62,7 +62,7 @@ def _make_runtime(model: TinyModel) -> MTPLXRuntime:
 
 
 def test_double_buffered_async_decode_default(monkeypatch):
-    """Verify generate_ar runs with async evaluation by default."""
+    """Verify generate_ar runs with async evaluation by default and tracks telemetry."""
     monkeypatch.delenv("MTPLX_SYNC_AR", raising=False)
     model = TinyModel()
     rt = _make_runtime(model)
@@ -74,6 +74,7 @@ def test_double_buffered_async_decode_default(monkeypatch):
         stop_token_ids=set(),
     )
     assert len(out.tokens) == 4
+    assert out.stats.verify_eval_time_s >= 0.0
 
 
 def test_double_buffered_async_decode_sync_flag(monkeypatch):
@@ -89,3 +90,31 @@ def test_double_buffered_async_decode_sync_flag(monkeypatch):
         stop_token_ids=set(),
     )
     assert len(out.tokens) == 4
+
+
+def test_double_buffered_async_decode_sync_overrides_pipeline_lane(monkeypatch):
+    """Verify MTPLX_SYNC_AR=1 prevents engagement of pipelined AR lane even when MTPLX_AR_PIPELINE=1."""
+    monkeypatch.setenv("MTPLX_SYNC_AR", "1")
+    monkeypatch.setenv("MTPLX_AR_PIPELINE", "1")
+
+    class PipelineModel(TinyModel):
+        def __init__(self):
+            super().__init__()
+            self.pipeline_mode_set = False
+
+        def set_ar_pipeline_mode(self, val):
+            self.pipeline_mode_set = val
+            return True
+
+    model = PipelineModel()
+    rt = _make_runtime(model)
+    out = generate_ar(
+        rt,
+        [0],
+        max_tokens=4,
+        sampler=SamplerConfig(temperature=0.7, top_p=1.0, top_k=4),
+        stop_token_ids=set(),
+    )
+    assert len(out.tokens) == 4
+    # Pipeline mode should not have been activated
+    assert model.pipeline_mode_set is False
