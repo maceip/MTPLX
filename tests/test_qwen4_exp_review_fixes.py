@@ -1398,18 +1398,17 @@ def test_qsa_indexer_admits_partially_padded_blocks_with_per_token_mask():
     indexer = QSAIndexer(args)
     indexer.block_topk = 1
 
-    # Left padding is 3 (less than compress_ratio 4, so block 0 is partially padded)
+    # Left padding is 3, logical blocks partition real tokens starting at 3
     left_padding = mx.array([3])
     q = mx.ones((1, 1, 2, 32))
     q_pos = mx.array([8])
-    pooled = mx.ones((1, 3, 32))  # 3 blocks: block 0 (0..3), block 1 (4..7), block 2 (8..11)
+    pooled = mx.ones((1, 3, 32))
 
     sel = indexer.select(q, q_pos, pooled, kv_len=12, left_padding=left_padding)
-    # Block 0 ends at 4 > 3, so it is admitted.
+    # Logical block 0 starts at physical index 3: [3, 4, 5, 6]
     selected_block_tokens = sel.token_idx[0, 0, :4].tolist()
-    assert selected_block_tokens == [0, 1, 2, 3]
-    # Tokens 0, 1, 2 are pad tokens (< 3), token 3 is valid (>= 3)
-    assert sel.valid[0, 0, :4].tolist() == [False, False, False, True]
+    assert selected_block_tokens == [3, 4, 5, 6]
+    assert sel.valid[0, 0, :4].tolist() == [True, True, True, True]
 
 
 def test_preserve_conv_state_across_masked_timesteps():
@@ -1723,7 +1722,7 @@ def test_attn_cache_filters_left_padding_and_lengths():
     assert int(merged.left_padding[0].item()) == 0
     assert int(merged.indexer.left_padding[0].item()) == 0
 
-    # Filter unmerged _AttnCache directly
+    # Filter unmerged _AttnCache directly (preserves logical offset)
     c_multi = _AttnCache()
     c_multi.keys = mx.ones((2, 2, 8, 32))
     c_multi.values = mx.ones((2, 2, 8, 32))
@@ -1733,7 +1732,7 @@ def test_attn_cache_filters_left_padding_and_lengths():
     assert c_multi.keys.shape[0] == 1
     assert c_multi.keys.shape[2] == 4
     assert int(c_multi.left_padding[0].item()) == 0
-    assert int(c_multi.offset) == 4
+    assert int(c_multi.offset) == 8
 
     # Extract
     c1_ext = c1.extract(0)
@@ -2169,7 +2168,7 @@ def test_qsa_indexer_select_admits_partially_padded_blocks_with_correct_mask():
     # 2 blocks of 4 tokens = 8 tokens. left_padding = 5 (tokens 0..4 are pad, 5..7 are real)
     pooled = mx.ones((1, 2, 16))
     q = mx.ones((1, 1, 2, 16))
-    q_pos = mx.array([7])
+    q_pos = mx.array([2])
     left_padding = mx.array([5])
 
     sel = indexer.select(
@@ -2179,8 +2178,7 @@ def test_qsa_indexer_select_admits_partially_padded_blocks_with_correct_mask():
         kv_len=8,
         left_padding=left_padding,
     )
-    # Block 1 should be selected since its end (8) > left_padding (5)
-    # In token_idx: token 4 must be masked as invalid, while tokens 5, 6, 7 are valid
+    # Logical tail tokens (physical 5, 6, 7) must be valid
     tok_list = sel.token_idx.flatten().tolist()
     val_list = sel.valid.flatten().tolist()
     valid_tokens = [tok for tok, v in zip(tok_list, val_list) if v]
@@ -2515,7 +2513,8 @@ def test_attn_cache_and_indexer_rebase_padding_on_filter():
     assert c.keys.shape[0] == 2
     assert c.keys.shape[2] == 5  # 10 - 5
     assert list(c.left_padding.tolist()) == [0, 2]  # [5-5, 7-5]
-    assert int(c.offset) == 5  # 10 - 5
+    # Logical offset is preserved across filtering
+    assert int(c.offset) == 10
 
     assert c.indexer.keys.shape[0] == 2
     assert c.indexer.keys.shape[1] == 5
@@ -3286,8 +3285,8 @@ def test_qsa_indexer_rotates_pooled_keys_at_logical_positions():
     assert cache_padded.pooled is not None
     pooled_padded = cache_padded.pooled
 
-    # Pooled vector for real block (block 1 in padded, block 0 in single) should match in rotation
-    assert mx.allclose(pooled_padded[0, 1, :], pooled_single[0, 0, :], atol=1e-5)
+    # Pooled vector for real block (block 0 in padded, block 0 in single) should match in rotation
+    assert mx.allclose(pooled_padded[0, 0, :], pooled_single[0, 0, :], atol=1e-5)
 
 
 def test_expected_mtp_file_discovers_local_wildcard_sidecars(tmp_path):
@@ -3303,6 +3302,78 @@ def test_expected_mtp_file_discovers_local_wildcard_sidecars(tmp_path):
 
     found = expected_mtp_file(model_dir)
     assert found == sidecar
+
+
+def test_qsa_indexer_pools_on_logical_boundaries_with_non_divisible_padding():
+    from mtplx.models.qwen4_exp import QSAIndexer, TextArgs, RotaryEmbedding, _IndexerCache
+
+    args = TextArgs(
+        hidden_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        indexer_n_heads=2,
+        indexer_kv_heads=1,
+        indexer_head_dim=16,
+        indexer_budget=4,
+        indexer_compress_ratio=4,
+    )
+    indexer = QSAIndexer(args)
+    rope = RotaryEmbedding(args.indexer_head_dim, 10000.0)
+
+    # 1. Single unpadded row with 8 real tokens (logical 0..7)
+    # Token i has distinct values so we can check pooling
+    raw_single = mx.arange(8)[:, None] * mx.ones((1, 8, args.hidden_size))
+    cache_single = _IndexerCache()
+    indexer.index_qk_proj = lambda x: mx.concatenate([x[..., :32], x[..., :16]], axis=-1)
+    prep_single = indexer.prepare(raw_single, rope, cache_single, offset=0)
+    assert prep_single is not None
+
+    # 2. Padded row with 2 padding tokens (0, 0) + 8 real tokens (same values 0..7)
+    # Total length 10, left_padding = 2
+    pad = mx.zeros((1, 2, args.hidden_size))
+    raw_padded = mx.concatenate([pad, raw_single], axis=1)
+    cache_padded = _IndexerCache()
+    cache_padded.left_padding = mx.array([2], dtype=mx.int32)
+    prep_padded = indexer.prepare(raw_padded, rope, cache_padded, offset=0)
+    assert prep_padded is not None
+
+    # Pooled block 0 and 1 for the padded sequence must match single sequence unpadded exactly
+    assert mx.allclose(prep_padded.pooled[0, 0, :], prep_single.pooled[0, 0, :], atol=1e-5)
+    assert mx.allclose(prep_padded.pooled[0, 1, :], prep_single.pooled[0, 1, :], atol=1e-5)
+
+    # 3. Test select() on both: query at logical position 5 should select block 0 and tail
+    q_single = prep_single.q[:, 5:6]
+    sel_single = indexer.select(q_single, mx.array([5]), prep_single.pooled, 8, left_padding=None)
+
+    q_padded = prep_padded.q[:, 5:6]
+    sel_padded = indexer.select(q_padded, mx.array([5]), prep_padded.pooled, 10, left_padding=mx.array([2], dtype=mx.int32))
+
+    # Padded selected tokens should be physical indices (2 + single_indices)
+    assert list(sel_padded.token_idx[0, 0].tolist()) == [i + 2 for i in sel_single.token_idx[0, 0].tolist()]
+
+
+def test_attn_cache_filter_preserves_logical_offset_with_shared_padding():
+    from mtplx.models.qwen4_exp import _AttnCache
+
+    # Create merged cache of row 0 (len 8, pad 0, off 8) and row 1 (len 4, pad 4, off 4)
+    c = _AttnCache()
+    c.keys = mx.ones((2, 2, 8, 32))
+    c.values = mx.ones((2, 2, 8, 32))
+    c.offset = mx.array([8, 4], dtype=mx.int32)
+    c.left_padding = mx.array([0, 4], dtype=mx.int32)
+    c._idx = 8
+
+    # Filter to retain only row 1 (which has min_left_pad = 4)
+    c.filter(mx.array([1]))
+
+    assert c.keys.shape == (1, 2, 4, 32)
+    assert c.values.shape == (1, 2, 4, 32)
+    assert c._idx == 4
+    assert int(c.left_padding[0].item()) == 0
+    # Logical offset of row 1 must remain 4 (not 0!)
+    assert int(c.offset[0].item()) == 4
 
 
 

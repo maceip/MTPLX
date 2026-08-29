@@ -586,89 +586,48 @@ class QSAIndexer(nn.Module):
         if kv_len <= self.token_budget:
             return None
 
-        n_blocks = kv_len // self.compress_ratio
-        if n_blocks <= 0:
-            return None
-
         r = self.compress_ratio
         left_padding = getattr(cache, "left_padding", None)
         if left_padding is None and hasattr(cache, "indexer"):
             left_padding = getattr(cache.indexer, "left_padding", None)
 
-        if cache is not None:
-            cached_pooled = getattr(cache, "pooled", None)
-            n_cached = int(cached_pooled.shape[1]) if cached_pooled is not None else 0
-            if n_cached > n_blocks:
-                cached_pooled = cached_pooled[:, :n_blocks, :] if n_blocks > 0 else None
-                n_cached = n_blocks if n_blocks > 0 else 0
-
-            if n_cached < n_blocks:
-                new_raw_k = raw_k[:, n_cached * r : n_blocks * r, :]
-                n_new = n_blocks - n_cached
-                if left_padding is not None:
-                    tok_pos = mx.arange(n_cached * r, n_blocks * r)
-                    is_valid = tok_pos[None, :] >= left_padding[:, None]
-                    new_raw_k = mx.where(is_valid[..., None], new_raw_k, 0.0)
-                    valid_counts = mx.maximum(
-                        is_valid.reshape(B, n_new, r).sum(axis=-1, keepdims=True), 1
-                    )
-                    new_pooled = (
-                        new_raw_k.reshape(B, n_new, r, self.head_dim)
-                        .astype(mx.float32)
-                        .sum(axis=2)
-                        / valid_counts
-                    )
-                else:
-                    new_pooled = (
-                        new_raw_k.reshape(B, n_new, r, self.head_dim)
-                        .astype(mx.float32)
-                        .mean(axis=2)
-                    )
-                new_pooled = self.k_layernorm(new_pooled.astype(raw_k.dtype))
-                new_starts = mx.arange(n_cached, n_blocks) * r
-                if left_padding is not None:
-                    logical_starts = mx.maximum(0, new_starts[None, :] - left_padding[:, None])
-                    cos_k, sin_k = rope(logical_starts)
-                else:
-                    cos_k, sin_k = rope(new_starts[None, :])
-                new_pooled = _rope_partial(new_pooled, cos_k, sin_k)
-                pooled = (
-                    new_pooled
-                    if cached_pooled is None or n_cached == 0
-                    else mx.concatenate([cached_pooled, new_pooled], axis=1)
-                )
-                cache.pooled = pooled
-            else:
-                pooled = cached_pooled
-        else:
-            pooled_raw = raw_k[:, : n_blocks * r]
-            if left_padding is not None:
-                tok_pos = mx.arange(n_blocks * r)
-                is_valid = tok_pos[None, :] >= left_padding[:, None]
-                pooled_raw = mx.where(is_valid[..., None], pooled_raw, 0.0)
-                valid_counts = mx.maximum(
-                    is_valid.reshape(B, n_blocks, r).sum(axis=-1, keepdims=True), 1
-                )
-                pooled = (
-                    pooled_raw.reshape(B, n_blocks, r, self.head_dim)
-                    .astype(mx.float32)
-                    .sum(axis=2)
-                    / valid_counts
-                )
-            else:
-                pooled = (
-                    pooled_raw.reshape(B, n_blocks, r, self.head_dim)
-                    .astype(mx.float32)
-                    .mean(axis=2)
-                )
-            pooled = self.k_layernorm(pooled.astype(raw_k.dtype))
-            block_starts = mx.arange(n_blocks) * r
-            if left_padding is not None:
-                logical_starts = mx.maximum(0, block_starts[None, :] - left_padding[:, None])
-                cos_k, sin_k = rope(logical_starts)
-            else:
-                cos_k, sin_k = rope(block_starts[None, :])
+        if left_padding is None or (hasattr(left_padding, "tolist") and all(lp == 0 for lp in left_padding.tolist())):
+            max_n_blocks = kv_len // r
+            if max_n_blocks <= 0:
+                return None
+            pooled_raw = raw_k[:, : max_n_blocks * r].reshape(B, max_n_blocks, r, self.head_dim).mean(axis=2)
+            pooled = self.k_layernorm(pooled_raw.astype(raw_k.dtype))
+            cos_k, sin_k = rope(mx.arange(max_n_blocks)[None, :] * r)
             pooled = _rope_partial(pooled, cos_k, sin_k)
+        else:
+            lp_list = left_padding.tolist() if hasattr(left_padding, "tolist") else list(left_padding)
+            n_blocks_list = [max(0, (kv_len - int(lp)) // r) for lp in lp_list]
+            max_n_blocks = max(n_blocks_list) if n_blocks_list else 0
+            if max_n_blocks <= 0:
+                return None
+            rows_p = []
+            for i, (lp, nb) in enumerate(zip(lp_list, n_blocks_list)):
+                lp_i = int(lp)
+                if nb > 0:
+                    row_k = raw_k[i : i + 1, lp_i : lp_i + nb * r, :]
+                    row_raw = row_k.reshape(1, nb, r, self.head_dim).mean(axis=2)
+                    row_p = self.k_layernorm(row_raw.astype(raw_k.dtype))
+                    starts = mx.arange(nb)[None, :] * r
+                    cos_k, sin_k = rope(starts)
+                    row_p = _rope_partial(row_p, cos_k, sin_k)
+                    if nb < max_n_blocks:
+                        pad = max_n_blocks - nb
+                        row_p = mx.concatenate(
+                            [row_p, mx.zeros((1, pad, self.head_dim), dtype=row_p.dtype)],
+                            axis=1,
+                        )
+                else:
+                    row_p = mx.zeros((1, max_n_blocks, self.head_dim), dtype=raw_k.dtype)
+                rows_p.append(row_p)
+            pooled = mx.concatenate(rows_p, axis=0) if len(rows_p) > 1 else rows_p[0]
+
+        if cache is not None:
+            cache.pooled = pooled
 
         if isinstance(offset, mx.array):
             off_arr = offset.reshape(-1)
@@ -696,47 +655,65 @@ class QSAIndexer(nn.Module):
     ) -> QSASelection:
         """Score this query slice against every compressed block; return token idx."""
         B, S, _, _ = q.shape
-        n_blocks = int(pooled.shape[1])
+        max_n_blocks = int(pooled.shape[1])
         r = self.compress_ratio
 
-        if left_padding is not None:
-            phys_q_pos = (q_pos[None, :] if q_pos.ndim == 1 else q_pos) + left_padding[:, None]
-        else:
-            phys_q_pos = mx.broadcast_to(q_pos[None, :] if q_pos.ndim == 1 else q_pos, (B, S))
+        q_pos_2d = q_pos if q_pos.ndim == 2 else q_pos[None, :]
+        if q_pos_2d.shape[0] != B:
+            q_pos_2d = mx.broadcast_to(q_pos_2d, (B, S))
 
-        n_complete = (phys_q_pos + 1) // r
-        is_complete = mx.arange(n_blocks)[None, None, :] < n_complete[:, :, None]
+        n_complete = (q_pos_2d + 1) // r
 
         if left_padding is not None:
-            block_ends = (mx.arange(n_blocks) + 1) * r  # (n_blocks,)
-            is_not_pad = block_ends[None, None, :] > left_padding[:, None, None]  # (B, 1, n_blocks)
-            valid_block = is_complete & is_not_pad  # (B, S, n_blocks)
+            lp_list = (
+                left_padding.tolist()
+                if hasattr(left_padding, "tolist")
+                else list(left_padding)
+            )
+            n_blocks_per_row = mx.array(
+                [max(0, (kv_len - int(lp)) // r) for lp in lp_list], dtype=mx.int32
+            )
+            valid_block = (
+                (mx.arange(max_n_blocks)[None, None, :] < n_complete[:, :, None])
+                & (mx.arange(max_n_blocks)[None, None, :] < n_blocks_per_row[:, None, None])
+            )
         else:
-            valid_block = is_complete
+            valid_block = mx.arange(max_n_blocks)[None, None, :] < n_complete[:, :, None]
 
         # Sum_h ReLU(<q_h, k_b>) without materializing the 4-head score tensor.
         acc = None
-        pooled_t = pooled.astype(mx.float32).swapaxes(-1, -2)  # (B, D, n_blocks)
+        pooled_t = pooled.astype(mx.float32).swapaxes(-1, -2)  # (B, D, max_n_blocks)
         for h in range(self.n_heads):
-            s_h = q[:, :, h].astype(mx.float32) @ pooled_t  # (B, S, n_blocks)
+            s_h = q[:, :, h].astype(mx.float32) @ pooled_t  # (B, S, max_n_blocks)
             s_h = mx.maximum(s_h, 0)
             acc = s_h if acc is None else acc + s_h
         scores = acc / math.sqrt(self.head_dim)
         masked = mx.where(valid_block, scores, -mx.inf)
 
-        k_blk = min(self.block_topk, n_blocks)
+        k_blk = min(self.block_topk, max_n_blocks)
         top = mx.argpartition(-masked, k_blk - 1, axis=-1)[..., :k_blk]
         is_top_complete = mx.take_along_axis(valid_block, top, axis=-1)
         top = mx.where(is_top_complete, top, 0)
 
-        tok = (top[..., None] * r + mx.arange(r)).reshape(B, S, k_blk * r)
+        if left_padding is not None:
+            lp_arr = left_padding.reshape(B, 1, 1, 1)
+            tok = (lp_arr + top[..., None] * r + mx.arange(r)).reshape(B, S, k_blk * r)
+        else:
+            tok = (top[..., None] * r + mx.arange(r)).reshape(B, S, k_blk * r)
+
         valid_blk = mx.broadcast_to(
             is_top_complete[..., None], (*is_top_complete.shape, r)
         ).reshape(B, S, k_blk * r) & (tok < kv_len)
         if left_padding is not None:
             valid_blk = valid_blk & (tok >= left_padding[:, None, None])
 
-        tail_start = n_complete * r
+        if left_padding is not None:
+            tail_start = left_padding[:, None] + n_complete * r
+            phys_q_pos = left_padding[:, None] + q_pos_2d
+        else:
+            tail_start = n_complete * r
+            phys_q_pos = q_pos_2d
+
         tail = tail_start[:, :, None] + mx.arange(r)
         tail_valid = (tail <= phys_q_pos[:, :, None]) & (tail < kv_len)
         if left_padding is not None:
@@ -2043,11 +2020,6 @@ class _AttnCache(KVCache):
                 if self.keys is not None:
                     self.keys = self.keys[..., min_left_pad:, :]
                     self.values = self.values[..., min_left_pad:, :]
-                if getattr(self, "offset", None) is not None:
-                    if isinstance(self.offset, mx.array):
-                        self.offset -= min_left_pad
-                    elif isinstance(self.offset, (int, float)):
-                        self.offset = max(0, int(self.offset) - min_left_pad)
                 if hasattr(self, "_idx"):
                     self._idx = max(0, self._idx - min_left_pad)
                 self.left_padding -= min_left_pad
