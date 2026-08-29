@@ -2626,6 +2626,25 @@ def test_loaded_weights_bytes_deduplicates_and_ignores_unused_adapters(tmp_path)
     assert loaded_bytes == 3000
 
 
+def test_loaded_weights_bytes_includes_direct_trunk_and_sidecar(tmp_path):
+    from mtplx.server.openai import _loaded_weights_bytes_for_model_path
+
+    model_dir = tmp_path / "unindexed_model"
+    model_dir.mkdir()
+
+    # Unindexed trunk: model.safetensors (5000 bytes)
+    trunk = model_dir / "model.safetensors"
+    trunk.write_bytes(b"t" * 5000)
+
+    # Sidecar: model-mtp.safetensors (500 bytes)
+    sidecar = model_dir / "model-mtp.safetensors"
+    sidecar.write_bytes(b"s" * 500)
+
+    # Both trunk and sidecar should be included: 5000 + 500 = 5500 bytes
+    loaded_bytes = _loaded_weights_bytes_for_model_path(model_dir)
+    assert loaded_bytes == 5500
+
+
 def test_attn_cache_extract_slices_to_active_offset():
     from mtplx.models.qwen4_exp import _AttnCache
 

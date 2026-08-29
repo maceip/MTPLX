@@ -1683,9 +1683,10 @@ def _loaded_weights_bytes_for_model_path(model_path: str | Path | None) -> int |
         if not root.is_dir():
             return None
 
-        resolved_shards: set[Path] = set()
+        trunk_shards: set[Path] = set()
+        sidecar_shards: set[Path] = set()
 
-        # 1. Checkpoint index-based resolution
+        # 1. Checkpoint index-based trunk resolution
         index_path = root / "model.safetensors.index.json"
         if index_path.exists():
             try:
@@ -1695,11 +1696,31 @@ def _loaded_weights_bytes_for_model_path(model_path: str | Path | None) -> int |
                     for shard_name in set(weight_map.values()):
                         shard_path = (root / shard_name).resolve()
                         if shard_path.is_file():
-                            resolved_shards.add(shard_path)
+                            trunk_shards.add(shard_path)
             except Exception:
                 pass
 
-        # 2. Sidecar resolution
+        # 2. Direct trunk resolution when index is absent or empty
+        if not trunk_shards:
+            for candidate in ("model.safetensors", "weights.safetensors"):
+                p = (root / candidate).resolve()
+                if p.is_file():
+                    trunk_shards.add(p)
+            if not trunk_shards:
+                for p in root.glob("*.safetensors"):
+                    try:
+                        from mtplx.backends.registry import _is_mtp_sidecar_file
+
+                        if not _is_mtp_sidecar_file(p):
+                            resolved = p.resolve()
+                            if resolved.is_file():
+                                trunk_shards.add(resolved)
+                    except Exception:
+                        resolved = p.resolve()
+                        if resolved.is_file():
+                            trunk_shards.add(resolved)
+
+        # 3. Sidecar resolution
         try:
             from mtplx.artifacts import expected_mtp_file, load_config
 
@@ -1710,22 +1731,11 @@ def _loaded_weights_bytes_for_model_path(model_path: str | Path | None) -> int |
                 cfg = {}
             mtp_file = expected_mtp_file(root, cfg)
             if mtp_file and mtp_file.exists():
-                resolved_shards.add(mtp_file.resolve())
+                sidecar_shards.add(mtp_file.resolve())
         except Exception:
             pass
 
-        # 3. If no index found, look for direct trunk shards
-        if not resolved_shards:
-            for candidate in ("model.safetensors", "weights.safetensors"):
-                p = (root / candidate).resolve()
-                if p.is_file():
-                    resolved_shards.add(p)
-            if not resolved_shards:
-                for p in root.glob("*.safetensors"):
-                    resolved = p.resolve()
-                    if resolved.is_file():
-                        resolved_shards.add(resolved)
-
+        resolved_shards = trunk_shards | sidecar_shards
         if not resolved_shards:
             from mtplx.engine_session import model_weights_bytes
 
