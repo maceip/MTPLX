@@ -41,11 +41,15 @@ def _source(node: ast.AST) -> str:
 
 def test_large_prefill_is_phase_gated_and_default_off():
     enabled = _source(_top_function("_qsa_prefill_enabled"))
+    require_flash = _source(_top_function("_qsa_prefill_require_flash"))
     route = _source(_top_function("_qsa_large_prefill_enabled"))
     selector_floor = _source(_top_function("_qsa_prefill_min_context"))
     flash_floor = _source(_top_function("_qsa_prefill_flash_min_context"))
     flash_route = _source(_top_function("_qsa_prefill_flash_attention_enabled"))
     assert 'os.environ.get("MTPLX_QSA_PREFILL") or "0"' in enabled
+    assert 'os.environ.get("MTPLX_QSA_PREFILL_REQUIRE_FLASH") or "0"' in (
+        require_flash
+    )
     assert 'current_attention_phase() == "prefill"' in route
     assert "int(rows) >= _qsa_prefill_min_rows()" in route
     assert "int(total_tokens) - int(rows) >= _qsa_prefill_min_context()" in route
@@ -103,6 +107,8 @@ def test_attention_consumes_blocks_directly_before_any_dense_ndim_path():
     assert "qsa_prefill_flash_supported(" in attention
     assert "qsa_prefill_flash(" in attention
     assert "_qsa_prefill_flash_attention_enabled(S, T)" in attention
+    assert "flash_requested and _qsa_prefill_require_flash()" in attention
+    assert "refusing dense fallback" in attention
     assert "cache.kv.keys" in attention
     assert "cache.kv.values" in attention
     assert "_qsa_blocks_to_dense_mask(" in attention
@@ -124,6 +130,7 @@ def test_all_prefill_knobs_are_registered_for_validated_operator_overrides():
     profiles = PROFILES_PATH.read_text(encoding="utf-8")
     for key in (
         "MTPLX_QSA_PREFILL",
+        "MTPLX_QSA_PREFILL_REQUIRE_FLASH",
         "MTPLX_QSA_PREFILL_MIN_ROWS",
         "MTPLX_QSA_PREFILL_MIN_CONTEXT",
         "MTPLX_QSA_PREFILL_FLASH_MIN_CONTEXT",

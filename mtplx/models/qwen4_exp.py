@@ -1136,6 +1136,19 @@ def _qsa_prefill_enabled() -> bool:
     return raw in {"1", "true", "yes", "on"}
 
 
+def _qsa_prefill_require_flash() -> bool:
+    """Fail closed instead of constructing a huge dense prefill mask.
+
+    This is an operator/benchmark assertion, not a shipping default.  At
+    million-token history a silent eligibility miss can turn the exact dense
+    fallback into multi-GiB transient allocations before the caller has any
+    evidence that the intended sparse consumer did not run.
+    """
+
+    raw = (os.environ.get("MTPLX_QSA_PREFILL_REQUIRE_FLASH") or "0").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
 def _qsa_prefill_min_rows() -> int:
     """Keep decode/short verify lanes separate from matrix-shaped prefill."""
 
@@ -2626,7 +2639,8 @@ class Attention(nn.Module):
             )
 
             _, block_ids, block_valid = sel_mask
-            if _qsa_prefill_flash_attention_enabled(S, T) and qsa_prefill_flash_supported(
+            flash_requested = _qsa_prefill_flash_attention_enabled(S, T)
+            flash_supported = flash_requested and qsa_prefill_flash_supported(
                 q,
                 cache.kv.keys,
                 cache.kv.values,
@@ -2635,7 +2649,8 @@ class Attention(nn.Module):
                 pos_start=pos_start,
                 total_tokens=T,
                 scale=self.scale,
-            ):
+            )
+            if flash_supported:
                 out = qsa_prefill_flash(
                     q,
                     cache.kv.keys,
@@ -2648,6 +2663,12 @@ class Attention(nn.Module):
                 )
                 out = out.transpose(0, 2, 1, 3).reshape(B, S, -1)
                 return self.o_proj(out * mx.sigmoid(gate))
+
+            if flash_requested and _qsa_prefill_require_flash():
+                raise RuntimeError(
+                    "QSA sparse prefill was required but the direct Metal "
+                    f"consumer rejected S={S}, T={T}; refusing dense fallback"
+                )
 
             # Static unsupported geometry falls back exactly.  Once the
             # supported kernel is dispatched, failures propagate instead of

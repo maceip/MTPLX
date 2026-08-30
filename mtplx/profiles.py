@@ -315,6 +315,7 @@ MODEL_RUNTIME_ENV_OVERRIDE_KEYS = frozenset(
         # dedicated Metal top-k, and direct block-sparse attention.  All
         # shipped profiles keep it off until numeric and production A/B gates.
         "MTPLX_QSA_PREFILL",
+        "MTPLX_QSA_PREFILL_REQUIRE_FLASH",
         "MTPLX_QSA_PREFILL_MIN_ROWS",
         # Independent measured crossovers: the tiled score/top-k producer can
         # amortize before the direct scattered K/V consumer does.

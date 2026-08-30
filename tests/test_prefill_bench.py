@@ -37,6 +37,7 @@ def test_prefill_env_snapshot_records_qsa_candidate_identity(monkeypatch) -> Non
         "MTPLX_FUSED_QSA_INDEXER": "1",
         "MTPLX_COMPILED_QSA_INDEXER": "1",
         "MTPLX_QSA_PREFILL": "1",
+        "MTPLX_QSA_PREFILL_REQUIRE_FLASH": "1",
         "MTPLX_QSA_PREFILL_MIN_CONTEXT": "32768",
         "MTPLX_QSA_PREFILL_FLASH_MIN_CONTEXT": "32768",
         "MTPLX_MEMORY_LIMIT_BYTES": "110G",
