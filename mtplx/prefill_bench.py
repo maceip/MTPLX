@@ -593,6 +593,26 @@ def _env_snapshot() -> dict[str, str]:
         "MTPLX_MTP_HISTORY_LAST_WINDOW_THRESHOLD",
         "MTPLX_DROP_EVENTS",
         "MTPLX_SKIP_VERIFY_SNAPSHOT",
+        # Qwen4-Exp QSA candidate identity. These are deliberately opt-in
+        # while the fused prefill stack is being measured, so omitting them
+        # from the artifact made an eager baseline and a fused run look
+        # identical after the process exited.
+        "MTPLX_NGRAM_RESIDENT",
+        "MTPLX_FUSED_QSA_QKV",
+        "MTPLX_FUSED_QSA_INDEXER",
+        "MTPLX_COMPILED_QSA_INDEXER",
+        "MTPLX_QSA_PREFILL",
+        "MTPLX_QSA_PREFILL_MIN_ROWS",
+        "MTPLX_QSA_PREFILL_MIN_CONTEXT",
+        "MTPLX_QSA_PREFILL_FLASH_MIN_CONTEXT",
+        "MTPLX_QSA_PREFILL_SCORE_MB",
+        "MTPLX_QSA_PREFILL_COMPILE_ROWS",
+        "MTPLX_QSA_MTP_PRECOMPUTE",
+        "MTPLX_QSA_FLASH",
+        "MTPLX_QSA_GATHER",
+        "MTPLX_QSA_GATHER_DECODE",
+        "MTPLX_MEMORY_LIMIT_BYTES",
+        "MTPLX_WIRED_LIMIT_BYTES",
     )
     return {key: os.environ[key] for key in keys if key in os.environ}
 

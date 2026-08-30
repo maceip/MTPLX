@@ -49,6 +49,7 @@ from typing import Any, Dict, List, Optional, Union
 
 import mlx.core as mx
 import mlx.nn as nn
+import numpy as np
 from mlx_lm.models.base import BaseModelArgs, create_ssm_mask
 from mlx_lm.models.cache import ArraysCache, KVCache
 from mlx_lm.models.qwen3_5 import GatedDeltaNet as _Qwen3_5GatedDeltaNet
@@ -171,10 +172,20 @@ def _rope_inv_freq_and_scaling(args: TextArgs) -> tuple[mx.array, float]:
     if not math.isfinite(base) or base <= 1.0:
         raise ValueError(f"rope_theta must be finite and greater than 1, got {base}")
 
-    positions = mx.arange(0, rotary_dim, 2, dtype=mx.float32)
-    position_frequencies = base ** (positions / rotary_dim)
+    # Transformers initializes this tiny, immutable buffer on Torch CPU in
+    # float32.  Mirror its operation order with NumPy rather than asking the
+    # Metal backend to evaluate ``pow``: the latter differs by up to two ULP
+    # at production geometry, which needlessly makes the QSA and HF reference
+    # paths disagree before either kernel has run.
+    positions = np.arange(0, rotary_dim, 2, dtype=np.float32)
+    position_frequencies = np.power(
+        np.float32(base),
+        positions / np.float32(rotary_dim),
+        dtype=np.float32,
+    )
     if rope_type == "default":
-        return 1.0 / position_frequencies, 1.0
+        inv_freq = np.float32(1.0) / position_frequencies
+        return mx.array(inv_freq, dtype=mx.float32), 1.0
     if rope_type != "yarn":
         raise ValueError(
             "Qwen4-Exp supports rope_type 'default' and static 'yarn'; "
@@ -245,19 +256,26 @@ def _rope_inv_freq_and_scaling(args: TextArgs) -> tuple[mx.array, float]:
     if low == high:
         high += 0.001
 
-    ramp = mx.clip(
-        (mx.arange(rotary_dim // 2, dtype=mx.float32) - low) / (high - low),
-        0.0,
-        1.0,
+    ramp = np.clip(
+        (
+            np.arange(rotary_dim // 2, dtype=np.float32)
+            - np.float32(low)
+        )
+        / np.float32(high - low),
+        np.float32(0.0),
+        np.float32(1.0),
     )
-    inv_freq_extrapolation = 1.0 / position_frequencies
-    inv_freq_interpolation = inv_freq_extrapolation / factor
-    extrapolation_factor = 1.0 - ramp
+    inv_freq_extrapolation = np.float32(1.0) / position_frequencies
+    # Keep this as 1 / (factor * frequency), matching Torch's rounding order.
+    inv_freq_interpolation = np.float32(1.0) / (
+        np.float32(factor) * position_frequencies
+    )
+    extrapolation_factor = np.float32(1.0) - ramp
     inv_freq = (
-        inv_freq_interpolation * (1.0 - extrapolation_factor)
+        inv_freq_interpolation * (np.float32(1.0) - extrapolation_factor)
         + inv_freq_extrapolation * extrapolation_factor
-    )
-    return inv_freq.astype(mx.float32), float(attention_scaling)
+    ).astype(np.float32, copy=False)
+    return mx.array(inv_freq, dtype=mx.float32), float(attention_scaling)
 
 
 def _rope_cos_sin(
@@ -2121,7 +2139,12 @@ class QSAIndexer(nn.Module):
             getattr(projection, "scales", None),
             getattr(projection, "biases", None),
         ]
-        return tuple(id(leaf) for leaf in leaves if isinstance(leaf, mx.array))
+        array_ids = tuple(id(leaf) for leaf in leaves if isinstance(leaf, mx.array))
+        scale_bits = struct.unpack(
+            "!Q",
+            struct.pack("!d", float(self._rope_attention_scaling)),
+        )[0]
+        return (*array_ids, scale_bits)
 
     def _get_compiled_indexer_core(self):
         """Build the graph bank only after final checkpoint weights exist."""

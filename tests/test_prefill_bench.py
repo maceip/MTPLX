@@ -8,6 +8,7 @@ import mtplx.generation as generation
 import mtplx.runtime as runtime
 from mtplx.prefill_bench import (
     DEFAULT_FINAL_REQUEST,
+    _env_snapshot,
     _prompt_build_for_context,
     _token_ids_for_context,
     run_prefill_ladder,
@@ -28,6 +29,25 @@ class _CharTokenizer:
         if add_generation_prompt:
             text += "<assistant>\n"
         return self.encode(text) if tokenize else text
+
+
+def test_prefill_env_snapshot_records_qsa_candidate_identity(monkeypatch) -> None:
+    expected = {
+        "MTPLX_FUSED_QSA_QKV": "1",
+        "MTPLX_FUSED_QSA_INDEXER": "1",
+        "MTPLX_COMPILED_QSA_INDEXER": "1",
+        "MTPLX_QSA_PREFILL": "1",
+        "MTPLX_QSA_PREFILL_MIN_CONTEXT": "32768",
+        "MTPLX_QSA_PREFILL_FLASH_MIN_CONTEXT": "32768",
+        "MTPLX_MEMORY_LIMIT_BYTES": "110G",
+        "MTPLX_WIRED_LIMIT_BYTES": "110G",
+    }
+    for key, value in expected.items():
+        monkeypatch.setenv(key, value)
+
+    receipt = _env_snapshot()
+
+    assert {key: receipt[key] for key in expected} == expected
 
 
 def test_prefill_prompt_preserves_coherent_tail() -> None:
