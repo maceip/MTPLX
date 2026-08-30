@@ -31,6 +31,7 @@ def _count_connects(tier, monkeypatch) -> list:
 
 def test_repeated_stats_polls_reuse_cached_aggregate(tmp_path, monkeypatch):
     tier = _tier(tmp_path)
+    tier._ensure_disk_usage_snapshot()
     try:
         calls = _count_connects(tier, monkeypatch)
         first = tier.stats()
