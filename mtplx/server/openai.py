@@ -805,12 +805,14 @@ def _server_runtime_env_overrides(
         #   library gated_delta_update dispatch). MTP two boot-triples, both
         #   orders: B/A/B +1.95 t/s (+3.06%, fused arm held the top-5 rows),
         #   A/B/A +1.45 t/s (+2.28%). Best arm mean of the campaign (67.15).
-        falsy_env = {"0", "false", "no", "off"}
+        truthy_env = {"1", "true", "yes", "on"}
+        gdn_raw = os.environ.get("MTPLX_COMPILED_GDN")
+        qwen4_raw = os.environ.get("MTPLX_QWEN4EXP_COMPILE")
         compiled_gdn_explicit_off = (
-            os.environ.get("MTPLX_COMPILED_GDN", "").strip().lower() in falsy_env
+            gdn_raw is not None and gdn_raw.strip().lower() not in truthy_env
         )
         qwen4_compile_explicit_off = (
-            os.environ.get("MTPLX_QWEN4EXP_COMPILE", "").strip().lower() in falsy_env
+            qwen4_raw is not None and qwen4_raw.strip().lower() not in truthy_env
         )
         for key in (
             "MTPLX_AR_PIPELINE",

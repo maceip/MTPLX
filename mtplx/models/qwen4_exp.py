@@ -152,7 +152,10 @@ class TextArgs(BaseModelArgs):
 
 
 def _build_rope_inv_freq(
-    dim: int, base: float, rope_parameters: Optional[Dict[str, Any]] = None
+    dim: int,
+    base: float,
+    rope_parameters: Optional[Dict[str, Any]] = None,
+    max_position_embeddings: int = 262144,
 ) -> tuple[mx.array, float]:
     mscale = 1.0
     inv_freq = base ** (-mx.arange(0, dim, 2, dtype=mx.float32) / dim)
@@ -160,7 +163,9 @@ def _build_rope_inv_freq(
     rope_type = str(rp.get("rope_type", rp.get("type", "default"))).lower()
     if rope_type == "yarn":
         factor = float(rp.get("factor", 1.0))
-        orig = float(rp.get("original_max_position_embeddings", 262144))
+        orig = float(
+            rp.get("original_max_position_embeddings", max_position_embeddings)
+        )
         beta_fast = float(rp.get("beta_fast", 32))
         beta_slow = float(rp.get("beta_slow", 1))
 
@@ -183,7 +188,9 @@ def _build_rope_inv_freq(
             freq_inter * freq_mask + freq_extra * (1.0 - freq_mask)
         )
         inv_freq = 1.0 / periods
-        if factor > 1:
+        if "attention_factor" in rp:
+            mscale = float(rp["attention_factor"])
+        elif factor > 1:
             mscale = 0.1 * math.log(factor) + 1.0
     return inv_freq, mscale
 
@@ -1243,7 +1250,7 @@ class QSAIndexer(nn.Module):
         self.k_layernorm = nn.RMSNorm(self.head_dim, eps=args.rms_norm_eps)
         rot = args.rotary_dim
         self._inv_freq, self._mscale = _build_rope_inv_freq(
-            rot, args.rope_theta, args.rope_parameters
+            rot, args.rope_theta, args.rope_parameters, args.max_position_embeddings
         )
 
     def _extend_pooled(self, cache: QSACache, total: int) -> Optional[mx.array]:
@@ -1480,7 +1487,7 @@ class Attention(nn.Module):
         self.indexer = QSAIndexer(args) if args.indexer_n_heads else None
         rot = args.rotary_dim
         self._inv_freq, self._mscale = _build_rope_inv_freq(
-            rot, args.rope_theta, args.rope_parameters
+            rot, args.rope_theta, args.rope_parameters, args.max_position_embeddings
         )
 
     def __call__(self, x: mx.array, cache: QSACache) -> mx.array:
@@ -2239,12 +2246,10 @@ class Qwen4ExpTextModel(nn.Module):
         )
         gdn_env = os.environ.get("MTPLX_COMPILED_GDN")
         qwen4_env = os.environ.get("MTPLX_QWEN4EXP_COMPILE")
-        falsy_env = {"0", "false", "no", "off"}
         truthy_env = {"1", "true", "yes", "on"}
-        self._gdn_compile_explicit_off = (
-            (gdn_env is not None and gdn_env.strip().lower() in falsy_env)
-            or (qwen4_env is not None and qwen4_env.strip().lower() in falsy_env)
-        )
+        gdn_disabled = gdn_env is not None and gdn_env.strip().lower() not in truthy_env
+        qwen4_disabled = qwen4_env is not None and qwen4_env.strip().lower() not in truthy_env
+        self._gdn_compile_explicit_off = gdn_disabled or qwen4_disabled
         if self._gdn_compile_explicit_off:
             self._gdn_compiled_env = False
         else:
