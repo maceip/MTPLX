@@ -1156,13 +1156,13 @@ def _qsa_gather_min_context() -> int:
 
 
 def _qsa_gather_max_rows() -> int:
-    """Rows-gather serves query widths 2..this (default 32: AR pipelining and
-    batched-verify widths). Copy-block rounds multiply the
+    """Rows-gather serves query widths 2..this (default 8: AR pipelining and
+    batched-verify widths). Copy-block rounds (25+ rows) multiply the
     gathered working set by S and stay on the dense path until measured."""
     try:
-        return max(2, int(os.environ.get("MTPLX_QSA_GATHER_MAX_ROWS") or 32))
+        return max(2, int(os.environ.get("MTPLX_QSA_GATHER_MAX_ROWS") or 8))
     except ValueError:
-        return 32
+        return 8
 
 
 def _qsa_flash_min_context() -> int:
@@ -1643,11 +1643,35 @@ class QSACache:
         # pooled_bits in (4, 8), maintain quantized q8/q4 mirror (Item 2)
         # to cut memory bandwidth by 75-87.5%.
         if self.pooled_bits in (4, 8):
-            slice_t = mx.swapaxes(self.pooled[:, :nb_total, :].astype(mx.float32), 1, 2)[:, None]
-            padded_nb = ((nb_total + 63) // 64) * 64
-            if padded_nb > nb_total:
-                slice_t = mx.pad(slice_t, [(0, 0), (0, 0), (0, 0), (0, padded_nb - nb_total)])
-            self.pooled_quant_t = mx.quantize(slice_t, group_size=64, bits=self.pooled_bits)
+            words_per_group = (64 * self.pooled_bits) // 32
+            start_grp = nb_start // 64
+            if self.pooled_quant_t is not None and start_grp > 0:
+                w_prev, s_prev, b_prev = self.pooled_quant_t
+                if s_prev.shape[-1] >= start_grp:
+                    start_block = start_grp * 64
+                    delta = self.pooled[:, start_block:nb_total, :].astype(mx.float32)
+                    delta_t = mx.swapaxes(delta, 1, 2)[:, None]
+                    n_delta = delta_t.shape[-1]
+                    padded_delta = ((n_delta + 63) // 64) * 64
+                    if padded_delta > n_delta:
+                        delta_t = mx.pad(delta_t, [(0, 0), (0, 0), (0, 0), (0, padded_delta - n_delta)])
+                    w_new, s_new, b_new = mx.quantize(delta_t, group_size=64, bits=self.pooled_bits)
+                    w = mx.concatenate([w_prev[..., :start_grp * words_per_group], w_new], axis=-1)
+                    s = mx.concatenate([s_prev[..., :start_grp], s_new], axis=-1)
+                    b = mx.concatenate([b_prev[..., :start_grp], b_new], axis=-1) if b_new is not None and b_prev is not None else None
+                    self.pooled_quant_t = (w, s, b)
+                else:
+                    slice_t = mx.swapaxes(self.pooled[:, :nb_total, :].astype(mx.float32), 1, 2)[:, None]
+                    padded_nb = ((nb_total + 63) // 64) * 64
+                    if padded_nb > nb_total:
+                        slice_t = mx.pad(slice_t, [(0, 0), (0, 0), (0, 0), (0, padded_nb - nb_total)])
+                    self.pooled_quant_t = mx.quantize(slice_t, group_size=64, bits=self.pooled_bits)
+            else:
+                slice_t = mx.swapaxes(self.pooled[:, :nb_total, :].astype(mx.float32), 1, 2)[:, None]
+                padded_nb = ((nb_total + 63) // 64) * 64
+                if padded_nb > nb_total:
+                    slice_t = mx.pad(slice_t, [(0, 0), (0, 0), (0, 0), (0, padded_nb - nb_total)])
+                self.pooled_quant_t = mx.quantize(slice_t, group_size=64, bits=self.pooled_bits)
             self.pooled_f32_t = None
         else:
             cap_blocks = self.pooled.shape[1]
@@ -2828,11 +2852,14 @@ class QSAIndexer(nn.Module):
 
 def _qsa_rows_gather_attention(
     q: mx.array,
-    k: mx.array,
-    v: mx.array,
+    k: mx.array | tuple[mx.array, mx.array, mx.array | None],
+    v: mx.array | tuple[mx.array, mx.array, mx.array | None],
     token_idx: mx.array,
     token_ok: mx.array,
     scale: float,
+    *,
+    group_size: int = 64,
+    bits: int | None = None,
 ) -> mx.array:
     """Attention over per-row gathered tokens (rows-gather lane).
 
@@ -2851,11 +2878,30 @@ def _qsa_rows_gather_attention(
     visible set.
     """
     B, H, S, D = q.shape
-    H_kv = int(k.shape[1])
     K = int(token_idx.shape[-1])
     flat = token_idx.reshape(-1)
-    k_sel = mx.take(k, flat, axis=2).reshape(1, H_kv, S, K, D)
-    v_sel = mx.take(v, flat, axis=2).reshape(1, H_kv, S, K, D)
+    if bits is not None:
+        kw, ks, kb = k
+        vw, vs, vb = v
+        H_kv = int(kw.shape[1])
+        k_sel = mx.dequantize(
+            mx.take(kw, flat, axis=2),
+            mx.take(ks, flat, axis=2),
+            mx.take(kb, flat, axis=2) if kb is not None else None,
+            group_size=group_size,
+            bits=bits,
+        ).reshape(1, H_kv, S, K, D)
+        v_sel = mx.dequantize(
+            mx.take(vw, flat, axis=2),
+            mx.take(vs, flat, axis=2),
+            mx.take(vb, flat, axis=2) if vb is not None else None,
+            group_size=group_size,
+            bits=bits,
+        ).reshape(1, H_kv, S, K, D)
+    else:
+        H_kv = int(k.shape[1])
+        k_sel = mx.take(k, flat, axis=2).reshape(1, H_kv, S, K, D)
+        v_sel = mx.take(v, flat, axis=2).reshape(1, H_kv, S, K, D)
     neg = mx.array(-mx.inf, dtype=mx.float32)
     if H != H_kv:
         rep = H // H_kv
@@ -2878,8 +2924,8 @@ def _qsa_rows_gather_attention(
 
 def _qsa_prefill_gather_attention(
     q: mx.array,
-    keys: mx.array,
-    values: mx.array,
+    keys: mx.array | tuple[mx.array, mx.array, mx.array | None],
+    values: mx.array | tuple[mx.array, mx.array, mx.array | None],
     block_ids: mx.array,
     block_valid: mx.array,
     *,
@@ -2888,6 +2934,8 @@ def _qsa_prefill_gather_attention(
     compress_ratio: int,
     scale: float,
     tile_rows: int,
+    group_size: int = 64,
+    bits: int | None = None,
 ) -> mx.array:
     """Portable bounded attention over the flash_prefill block contract.
 
@@ -2932,6 +2980,8 @@ def _qsa_prefill_gather_attention(
             token_idx,
             token_ok,
             scale,
+            group_size=group_size,
+            bits=bits,
         )
         mx.eval(out_t)
         outputs.append(out_t)
@@ -3126,39 +3176,82 @@ class Attention(nn.Module):
             # set. Reads the cache BACKING arrays in place at their
             # allocation stride — the :T slice above is non-contiguous, and
             # forcing it contiguous would copy the entire KV.
-            from mtplx.kernels.qsa_flash_skip import qsa_flash_skip
-
             _, blk_idx, tail_start = sel_mask
             if is_quant:
-                k_mat = mx.dequantize(*cache.kv.keys, group_size=cache.kv.group_size, bits=cache.kv.bits)
-                v_mat = mx.dequantize(*cache.kv.values, group_size=cache.kv.group_size, bits=cache.kv.bits)
+                tok_from_blocks = (
+                    blk_idx[:, None] * self.indexer.ratio + mx.arange(self.indexer.ratio, dtype=mx.int32)
+                ).reshape(-1)
+                tail_ids = mx.arange(tail_start, T, dtype=mx.int32)
+                tok_sel = mx.concatenate([tok_from_blocks, tail_ids])
+                kw, ks, kb = cache.kv.keys
+                vw, vs, vb = cache.kv.values
+                k_sel = mx.dequantize(
+                    mx.take(kw, tok_sel, axis=2),
+                    mx.take(ks, tok_sel, axis=2),
+                    mx.take(kb, tok_sel, axis=2) if kb is not None else None,
+                    group_size=cache.kv.group_size,
+                    bits=cache.kv.bits,
+                )
+                v_sel = mx.dequantize(
+                    mx.take(vw, tok_sel, axis=2),
+                    mx.take(vs, tok_sel, axis=2),
+                    mx.take(vb, tok_sel, axis=2) if vb is not None else None,
+                    group_size=cache.kv.group_size,
+                    bits=cache.kv.bits,
+                )
+                out = mx.fast.scaled_dot_product_attention(
+                    q, k_sel, v_sel, scale=self.scale, mask=None
+                )
+                out = out.transpose(0, 2, 1, 3).reshape(B, S, -1)
+                return self.o_proj(out * mx.sigmoid(gate))
             else:
+                from mtplx.kernels.qsa_flash_skip import qsa_flash_skip
+
                 k_mat, v_mat = cache.kv.keys, cache.kv.values
-            out = qsa_flash_skip(
-                q.reshape(self.n_heads, self.head_dim),
-                k_mat,
-                v_mat,
-                blk_idx,
-                T,
-                tail_start,
-                self.scale,
-            )
-            out = out.reshape(B, S, -1)
-            return self.o_proj(out * mx.sigmoid(gate))
+                out = qsa_flash_skip(
+                    q.reshape(self.n_heads, self.head_dim),
+                    k_mat,
+                    v_mat,
+                    blk_idx,
+                    T,
+                    tail_start,
+                    self.scale,
+                )
+                out = out.reshape(B, S, -1)
+                return self.o_proj(out * mx.sigmoid(gate))
 
         if isinstance(sel_mask, tuple) and sel_mask and sel_mask[0] == "flash_prefill":
             # Large-S prefill consumes compact per-row block selections
             # directly from the full cache backing.  This is the point of the
             # prefill port: no [S,T] selection expansion and no per-row K/V
             # gather on the supported production geometry.
+            _, block_ids, block_valid = sel_mask
+            if is_quant:
+                out = _qsa_prefill_gather_attention(
+                    q,
+                    cache.kv.keys,
+                    cache.kv.values,
+                    block_ids,
+                    block_valid,
+                    pos_start=pos_start,
+                    total_tokens=T,
+                    compress_ratio=self.indexer.ratio,
+                    scale=self.scale,
+                    tile_rows=_qsa_prefill_gather_tile_rows(),
+                    group_size=cache.kv.group_size,
+                    bits=cache.kv.bits,
+                )
+                _qsa_prefill_count("gather_tier")
+                out = out.transpose(0, 2, 1, 3).reshape(B, S, -1)
+                return self.o_proj(out * mx.sigmoid(gate))
+
             from mtplx.kernels.qsa_prefill_flash import (
                 qsa_prefill_flash,
                 qsa_prefill_flash_supported,
             )
 
-            _, block_ids, block_valid = sel_mask
-            k_backing = mx.dequantize(*cache.kv.keys, group_size=cache.kv.group_size, bits=cache.kv.bits) if is_quant else cache.kv.keys
-            v_backing = mx.dequantize(*cache.kv.values, group_size=cache.kv.group_size, bits=cache.kv.bits) if is_quant else cache.kv.values
+            k_backing = cache.kv.keys
+            v_backing = cache.kv.values
             if _qsa_prefill_flash_attention_enabled(S, T) and qsa_prefill_flash_supported(
                 q,
                 k_backing,
@@ -3223,21 +3316,16 @@ class Attention(nn.Module):
             # (adapting community PR #380 by @maceip).
             _, tok_idx, tok_ok = sel_mask
             if is_quant:
-                k_full = mx.dequantize(
-                    k[0],
-                    k[1],
-                    k[2],
+                out = _qsa_rows_gather_attention(
+                    q,
+                    cache.kv.keys,
+                    cache.kv.values,
+                    tok_idx,
+                    tok_ok,
+                    self.scale,
                     group_size=cache.kv.group_size,
                     bits=cache.kv.bits,
                 )
-                v_full = mx.dequantize(
-                    v[0],
-                    v[1],
-                    v[2],
-                    group_size=cache.kv.group_size,
-                    bits=cache.kv.bits,
-                )
-                out = _qsa_rows_gather_attention(q, k_full, v_full, tok_idx, tok_ok, self.scale)
             else:
                 out = _qsa_rows_gather_attention(q, k, v, tok_idx, tok_ok, self.scale)
             out = out.transpose(0, 2, 1, 3).reshape(B, S, -1)

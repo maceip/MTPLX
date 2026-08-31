@@ -195,6 +195,15 @@ def test_qsa_cache_quantized_pooled_mirror():
     assert view_unaligned.shape == (1, 1, 16, 23)
     assert mx.allclose(view_unaligned[0, 0], mx.swapaxes(blocks_unaligned[0], 0, 1), atol=1e-1).item()
 
+    # Test incremental append over group boundary (e.g. 70 blocks then add 80 more -> 150 blocks)
+    cache_inc = QSACache(kv_bits=8)
+    all_blocks = mx.random.normal((1, 150, 16)).astype(mx.float32)
+    cache_inc.write_pooled(all_blocks[:, :70, :], 0, 70)
+    cache_inc.write_pooled(all_blocks[:, 70:150, :], 70, 150)
+    view_inc = cache_inc.pooled_f32_view(150)
+    assert view_inc.shape == (1, 1, 16, 150)
+    assert mx.allclose(view_inc[0, 0], mx.swapaxes(all_blocks[0], 0, 1), atol=1e-1).item()
+
 
 def test_select_backend_context_window_clamps_to_model_max():
     from mtplx.backends.descriptors import QWEN3_NEXT_DESCRIPTOR

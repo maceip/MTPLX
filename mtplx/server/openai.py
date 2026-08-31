@@ -836,8 +836,6 @@ def _server_runtime_env_overrides(
                     overrides.setdefault("MTPLX_QSA_FLASH", "1")
             except Exception:
                 pass
-        if os.environ.get("MTPLX_COMPILED_VERIFY_MAX_CONTEXT") is None:
-            overrides.setdefault("MTPLX_COMPILED_VERIFY_MAX_CONTEXT", "0")
         if os.environ.get("MTPLX_NAX_VERIFY") is None:
             # The turbo profile arms the 27B NAX verify patch
             # (MTPLX_NAX_VERIFY=1); on this family it is unmeasured and

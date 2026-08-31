@@ -433,13 +433,9 @@ def plan_memory(
         budget = None
     if usable_bytes_override is not None and int(usable_bytes_override) > 0:
         # The override is the Metal limit the server actually configured —
-        # computed from the REAL machine. Under a tighter --memory-budget
-        # the formula on the planning RAM must still win, or a simulated
-        # 48G seat would inherit the 128G box's 96G envelope.
-        if budget is not None:
-            usable = min(int(usable_bytes_override), usable_engine_bytes(planning_ram))
-        else:
-            usable = min(total_ram, int(usable_bytes_override))
+        # computed from the REAL machine. Bounded by usable_engine_bytes
+        # so --memory-budget or MTPLX_ENGINE_RAM_FRACTION envelopes still win.
+        usable = min(int(usable_bytes_override), usable_engine_bytes(planning_ram))
     else:
         usable = usable_engine_bytes(planning_ram)
 
