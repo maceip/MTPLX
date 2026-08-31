@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 import time
@@ -58,19 +59,11 @@ def _generate_haystack(
     needle: str,
     needle_depth_fraction: float,
 ) -> tuple[str, int]:
-    """Generate a haystack of approximately target_tokens with needle at depth_fraction."""
-    # Approximate ~5.2 chars per token for English text with punctuation/spaces
-    target_chars = int(target_tokens * 5.2)
-    
-    # Build text blocks until we reach target_chars
-    blocks = []
-    current_chars = 0
-    idx = 0
-    while current_chars < target_chars:
-        p = ESSAY_CORPUS[idx % len(ESSAY_CORPUS)]
-        blocks.append(p)
-        current_chars += len(p) + 2
-        idx += 1
+    """Generate a haystack of target_tokens with needle at depth_fraction."""
+    # 5 paragraphs in ESSAY_CORPUS = 319 tokens (~63.8 tokens/paragraph).
+    # Task suffix adds ~30 tokens, needle adds ~20 tokens.
+    n_paras = max(1, int(math.ceil((target_tokens - 50) / 63.8)))
+    blocks = [ESSAY_CORPUS[i % len(ESSAY_CORPUS)] for i in range(n_paras)]
 
     # Insert needle at the requested fraction
     insertion_idx = max(0, min(len(blocks) - 1, int(len(blocks) * needle_depth_fraction)))

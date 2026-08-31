@@ -455,17 +455,32 @@ def _runtime_count(rt: MTPLXRuntime, key: str, amount: int = 1) -> None:
 
 
 def _runtime_counter_snapshot(rt: MTPLXRuntime) -> dict[str, int]:
-    return {
+    base = {
         str(key): int(value)
         for key, value in getattr(rt, "diagnostic_counters", {}).items()
     }
+    try:
+        from mtplx.models.qwen4_exp import qsa_prefill_engagement
+
+        for k, v in qsa_prefill_engagement().items():
+            base[f"qsa_{k}"] = int(v)
+    except Exception:
+        pass
+    return base
 
 
 def _runtime_counter_delta(
     rt: MTPLXRuntime,
     before: dict[str, int],
 ) -> dict[str, int]:
-    current = getattr(rt, "diagnostic_counters", {})
+    current = dict(getattr(rt, "diagnostic_counters", {}))
+    try:
+        from mtplx.models.qwen4_exp import qsa_prefill_engagement
+
+        for k, v in qsa_prefill_engagement().items():
+            current[f"qsa_{k}"] = int(v)
+    except Exception:
+        pass
     keys = set(before) | set(current)
     return {
         str(key): int(current.get(key, 0)) - int(before.get(key, 0)) for key in keys
@@ -624,8 +639,11 @@ def _attach_runtime_diagnostics(
         owned_attn.get("decode_partitioned_paged_calls") or 0
     )
     try:
-        from mtplx.models.qwen4_exp import qsa_prefill_engagement
-        qsa_counts = qsa_prefill_engagement()
+        qsa_counts = {
+            k[4:]: int(counters.get(k, 0))
+            for k in counters.keys()
+            if k.startswith("qsa_")
+        }
         stats.decode_flash_skip = qsa_counts.get("decode_flash_skip", 0)
         stats.decode_dense_mask = qsa_counts.get("decode_dense_mask", 0)
         stats.gather_rows = qsa_counts.get("gather_rows", 0)
@@ -3881,7 +3899,9 @@ def restore_or_prefill_prompt_state(
         # MTP-enabled runtimes keep their requested committed policy.
         mtp_history_policy = "cycle"
     mtp_history_window_tokens = (
-        _mtp_history_last_window_tokens() if mtp_history_policy == "last_window" else 0
+        _mtp_history_last_window_tokens(len(prompt_ids))
+        if mtp_history_policy == "last_window"
+        else 0
     )
     # Dashboard prefill instrumentation. We fire `phase: "started"` before
     # any restore/prefill work runs (so the UI can flip into prefill mode

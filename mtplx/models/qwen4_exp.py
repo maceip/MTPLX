@@ -1644,6 +1644,9 @@ class QSACache:
         # to cut memory bandwidth by 75-87.5%.
         if self.pooled_bits in (4, 8):
             slice_t = mx.swapaxes(self.pooled[:, :nb_total, :].astype(mx.float32), 1, 2)[:, None]
+            padded_nb = ((nb_total + 63) // 64) * 64
+            if padded_nb > nb_total:
+                slice_t = mx.pad(slice_t, [(0, 0), (0, 0), (0, 0), (0, padded_nb - nb_total)])
             self.pooled_quant_t = mx.quantize(slice_t, group_size=64, bits=self.pooled_bits)
             self.pooled_f32_t = None
         else:
@@ -1674,17 +1677,22 @@ class QSACache:
         maintained buffer."""
         if self.pooled_bits in (4, 8):
             if self.pooled_quant_t is None and self.pooled is not None and self.pooled.shape[1] > 0:
-                slice_t = mx.swapaxes(self.pooled[:, :nb, :].astype(mx.float32), 1, 2)[:, None]
+                nb_val = self.pooled.shape[1]
+                slice_t = mx.swapaxes(self.pooled[:, :nb_val, :].astype(mx.float32), 1, 2)[:, None]
+                padded_nb = ((nb_val + 63) // 64) * 64
+                if padded_nb > nb_val:
+                    slice_t = mx.pad(slice_t, [(0, 0), (0, 0), (0, 0), (0, padded_nb - nb_val)])
                 self.pooled_quant_t = mx.quantize(slice_t, group_size=64, bits=self.pooled_bits)
             if self.pooled_quant_t is not None:
                 w, s, b = self.pooled_quant_t
-                return mx.dequantize(
-                    w[..., :nb],
-                    s[..., : (nb + 63) // 64],
-                    b[..., : (nb + 63) // 64] if b is not None else None,
+                dequant = mx.dequantize(
+                    w,
+                    s,
+                    b,
                     group_size=64,
                     bits=self.pooled_bits,
                 )
+                return dequant[..., :nb]
         if self.pooled_f32_t is None or self.pooled_f32_t.shape[3] < nb:
             self.pooled_f32_t = mx.swapaxes(
                 self.pooled.astype(mx.float32), 1, 2
@@ -1806,7 +1814,11 @@ class QSACache:
         self.pooled_len = 0 if pooled is None else pooled.shape[1]
         # Item 5 / Item 2: Seed the mirror directly from restored pooled
         if self.pooled_bits in (4, 8) and pooled is not None and pooled.shape[1] > 0:
+            nb_val = pooled.shape[1]
             slice_t = mx.swapaxes(pooled.astype(mx.float32), 1, 2)[:, None]
+            padded_nb = ((nb_val + 63) // 64) * 64
+            if padded_nb > nb_val:
+                slice_t = mx.pad(slice_t, [(0, 0), (0, 0), (0, 0), (0, padded_nb - nb_val)])
             self.pooled_quant_t = mx.quantize(slice_t, group_size=64, bits=self.pooled_bits)
             self.pooled_f32_t = None
         elif pooled is not None and pooled.shape[1] > 0:
@@ -2593,7 +2605,11 @@ class QSAIndexer(nn.Module):
         cache.pooled_len = logical_blocks
         # Item 5 / Item 2: Maintain mirror directly from updated pooled
         if cache.pooled_bits in (4, 8) and result.pooled is not None and result.pooled.shape[1] > 0:
+            nb_val = result.pooled.shape[1]
             slice_t = mx.swapaxes(result.pooled.astype(mx.float32), 1, 2)[:, None]
+            padded_nb = ((nb_val + 63) // 64) * 64
+            if padded_nb > nb_val:
+                slice_t = mx.pad(slice_t, [(0, 0), (0, 0), (0, 0), (0, padded_nb - nb_val)])
             cache.pooled_quant_t = mx.quantize(slice_t, group_size=64, bits=cache.pooled_bits)
             cache.pooled_f32_t = None
         elif result.pooled is not None and result.pooled.shape[1] > 0:
@@ -3207,21 +3223,21 @@ class Attention(nn.Module):
             # (adapting community PR #380 by @maceip).
             _, tok_idx, tok_ok = sel_mask
             if is_quant:
-                k_g = mx.dequantize(
-                    mx.take(k[0], tok_idx, axis=2),
-                    mx.take(k[1], tok_idx, axis=2),
-                    mx.take(k[2], tok_idx, axis=2),
+                k_full = mx.dequantize(
+                    k[0],
+                    k[1],
+                    k[2],
                     group_size=cache.kv.group_size,
                     bits=cache.kv.bits,
                 )
-                v_g = mx.dequantize(
-                    mx.take(v[0], tok_idx, axis=2),
-                    mx.take(v[1], tok_idx, axis=2),
-                    mx.take(v[2], tok_idx, axis=2),
+                v_full = mx.dequantize(
+                    v[0],
+                    v[1],
+                    v[2],
                     group_size=cache.kv.group_size,
                     bits=cache.kv.bits,
                 )
-                out = _qsa_rows_gather_attention(q, k_g, v_g, tok_idx, tok_ok, self.scale)
+                out = _qsa_rows_gather_attention(q, k_full, v_full, tok_idx, tok_ok, self.scale)
             else:
                 out = _qsa_rows_gather_attention(q, k, v, tok_idx, tok_ok, self.scale)
             out = out.transpose(0, 2, 1, 3).reshape(B, S, -1)
@@ -3404,57 +3420,6 @@ class NGramTable(nn.Module):
             self._lazy_parts = None
             return False
 
-    def attach_hot_shard(self, path: Path, hot_rows: Optional[int] = None) -> bool:
-        """Bind the top-N Zipf-hot rows as resident mx arrays for in-graph gathers,
-        falling through to SSD sidecar on miss (Item 8)."""
-        try:
-            import numpy as np
-            header, data_start = _read_safetensors_header(path)
-            meta = header.get("__metadata__", {})
-            bits = int(meta.get("ngram_bits", 4))
-            group = int(meta.get("ngram_group_size", 32))
-            if hot_rows is None:
-                try:
-                    hot_rows = max(1024, int(os.environ.get("MTPLX_NGRAM_HOT_ROWS") or 65536))
-                except ValueError:
-                    hot_rows = 65536
-            total_rows = self.rows
-            bound_rows = min(total_rows, hot_rows)
-            entries = {}
-            names = ("weight",) if bits == 0 else ("weight", "scales", "biases")
-            for name in names:
-                info = header[f"ngram.{name}"]
-                entries[name] = (info, data_start)
-            loaded_parts = []
-            for name in ("weight", "scales", "biases"):
-                if name not in entries:
-                    loaded_parts.append(None)
-                    continue
-                info, dstart = entries[name]
-                dtype = {"U32": np.uint32, "BF16": np.uint16, "F16": np.uint16}[info["dtype"]]
-                shape = list(info["shape"])
-                shape[0] = bound_rows
-                offset = dstart + info["data_offsets"][0]
-                mm = np.memmap(path, mode="r", dtype=dtype, offset=offset, shape=tuple(shape))
-                arr = mx.array(np.array(mm))
-                mx.eval(arr)
-                loaded_parts.append(arr)
-            self._hot_parts = tuple(loaded_parts)
-            self._hot_rows = bound_rows
-            self._hot_bits = bits
-            self._hot_group = group
-            print(
-                f"[qwen4_exp] ngram hot shard resident: {bound_rows} rows bound in RAM "
-                f"(pipelined-AR lane armed, SSD sidecar fallback on miss)",
-                flush=True,
-            )
-            return True
-        except Exception as exc:
-            print(f"[qwen4_exp] ngram hot shard bind failed: {exc!r}", flush=True)
-            self._hot_parts = None
-            self._hot_rows = 0
-            return False
-
     def _lazy_gather(self, ids: mx.array) -> mx.array:
         w, s, b = self._lazy_parts
         rows_w = w[ids]
@@ -3464,26 +3429,9 @@ class NGramTable(nn.Module):
             rows_w, s[ids], b[ids], group_size=self._lazy_group, bits=self._lazy_bits
         )
 
-    def _hot_gather(self, ids: mx.array) -> mx.array:
-        w, s, b = self._hot_parts
-        rows_w = w[ids]
-        if self._hot_bits == 0:
-            return rows_w
-        return mx.dequantize(
-            rows_w, s[ids], b[ids], group_size=self._hot_group, bits=self._hot_bits
-        )
-
     def __call__(self, ids: mx.array) -> mx.array:
-        if getattr(self, "prefer_lazy", False):
-            if getattr(self, "_lazy_parts", None) is not None:
-                return self._lazy_gather(ids)
-            if getattr(self, "_hot_parts", None) is not None and getattr(self, "_hot_rows", 0) > 0:
-                try:
-                    max_id = int(mx.max(ids).item()) if ids.size > 0 else 0
-                    if max_id < self._hot_rows:
-                        return self._hot_gather(ids)
-                except Exception:
-                    pass
+        if getattr(self, "prefer_lazy", False) and getattr(self, "_lazy_parts", None) is not None:
+            return self._lazy_gather(ids)
         if self._sidecar is not None:
             return self._sidecar(ids, self.dim)
         if self._sidecar_mode:
@@ -4583,15 +4531,13 @@ class Model(nn.Module):
                 sidecar = table._sidecar
                 if resident:
                     table.attach_resident(path)
-                else:
-                    table.attach_hot_shard(path)
         if sidecar is not None and not resident:
             hot_mb = (sidecar._hot_cap_rows * sidecar._hot_row_bytes) // 2**20
             print(
-                "[qwen4_exp] ngram table: streamed from SSD with hot RAM shard "
-                f"(file-backed pages, hot cache {hot_mb}M, prefetch "
+                "[qwen4_exp] ngram table: streamed from SSD (file-backed "
+                f"pages, hot cache {hot_mb}M, prefetch "
                 f"{'on' if sidecar._pool is not None else 'off'}) — "
-                "full resident only at >=160G RAM or MTPLX_NGRAM_RESIDENT=1",
+                "resident only at >=160G RAM or MTPLX_NGRAM_RESIDENT=1",
                 flush=True,
             )
 
@@ -4606,10 +4552,7 @@ class Model(nn.Module):
                 continue
             emb = layer.ple.ple_embedding
             table = emb.ngram_embedding
-            has_residency = (
-                getattr(table, "_lazy_parts", None) is not None
-                or getattr(table, "_hot_parts", None) is not None
-            )
+            has_residency = getattr(table, "_lazy_parts", None) is not None
             if enabled and not has_residency:
                 ready = False
                 continue

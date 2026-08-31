@@ -2071,23 +2071,24 @@ def _select_backend_context_window(
     KV actually fits this machine's engine envelope (issue #305: the flat
     model-max default admitted 262k-token prompts on 48 GB Macs, whose KV
     alone exceeds the Metal budget — swap-death, not an error message).
-    It shapes only the DEFAULT: an explicit --context-window always wins,
-    with the plan warning loudly instead of refusing.
+    It shapes only the DEFAULT: an explicit --context-window overrides
+    machine_fit while remaining clamped to the model capability.
     """
     requested_value = int(requested or 0)
-    if requested_value > 0:
-        return max(4_096, requested_value)
     default_value = (
         backend.context_window_policy.default
         if backend.backend_id == "laguna_ar"
         else int(model_max)
     )
     fit = int(machine_fit or 0)
-    if fit > 0:
+    if requested_value <= 0 and fit > 0:
         default_value = min(int(default_value), fit)
     return max(
         4_096,
-        min(int(model_max), int(default_value)),
+        min(
+            int(model_max),
+            requested_value if requested_value > 0 else int(default_value),
+        ),
     )
 
 

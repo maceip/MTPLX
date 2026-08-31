@@ -186,6 +186,27 @@ def test_qsa_cache_quantized_pooled_mirror():
     view4 = cache4.pooled_f32_view(64)
     assert view4.shape == (1, 1, 16, 64)
 
+    # Test arbitrary unaligned block counts (e.g. 23 blocks)
+    cache_unaligned = QSACache(kv_bits=8)
+    blocks_unaligned = mx.random.normal((1, 23, 16)).astype(mx.float32)
+    cache_unaligned.write_pooled(blocks_unaligned, 0, 23)
+    assert cache_unaligned.pooled_quant_t is not None
+    view_unaligned = cache_unaligned.pooled_f32_view(23)
+    assert view_unaligned.shape == (1, 1, 16, 23)
+    assert mx.allclose(view_unaligned[0, 0], mx.swapaxes(blocks_unaligned[0], 0, 1), atol=1e-1).item()
+
+
+def test_select_backend_context_window_clamps_to_model_max():
+    from mtplx.backends.descriptors import QWEN3_NEXT_DESCRIPTOR
+    from mtplx.server.openai import _select_backend_context_window
+
+    # Explicit request <= model_max succeeds
+    assert _select_backend_context_window(QWEN3_NEXT_DESCRIPTOR, model_max=262144, requested=131072, machine_fit=65536) == 131072
+    # Explicit request > model_max is clamped to model_max
+    assert _select_backend_context_window(QWEN3_NEXT_DESCRIPTOR, model_max=262144, requested=1048576, machine_fit=65536) == 262144
+    # Default without explicit request honors machine_fit
+    assert _select_backend_context_window(QWEN3_NEXT_DESCRIPTOR, model_max=262144, requested=None, machine_fit=65536) == 65536
+
 
 def test_adaptive_mtp_history_window_throttling():
     from mtplx.generation import _mtp_history_last_window_tokens
