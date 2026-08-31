@@ -415,8 +415,19 @@ def _mtp_history_uses_committed_cache(policy: str) -> bool:
     return _normalize_mtp_history_policy(policy) in {"committed", "last_window"}
 
 
-def _mtp_history_last_window_tokens() -> int:
-    return max(1, _env_int("MTPLX_MTP_HISTORY_LAST_WINDOW", 8192))
+def _mtp_history_last_window_tokens(prompt_tokens: int = 0) -> int:
+    base = max(1, _env_int("MTPLX_MTP_HISTORY_LAST_WINDOW", 8192))
+    # Adaptive MTP Window Throttling at Extreme Depths (Item 3):
+    # Cap draft head history window at 16k when context > 262k to keep verification rounds bounded < 5ms.
+    if prompt_tokens > 262144:
+        cap = _env_int("MTPLX_MTP_HISTORY_DEEP_CAP", 16384)
+        return min(max(base, 16384), cap)
+    # Context-scaled widening window (Item 6): 8k at 16k, 16k at 32k, 32k at 64k+
+    if prompt_tokens >= 65536:
+        return max(base, 32768)
+    if prompt_tokens >= 32768:
+        return max(base, 16384)
+    return base
 
 
 def _resolve_mtp_history_policy(requested_policy: str, prompt_tokens: int) -> str:
@@ -612,6 +623,17 @@ def _attach_runtime_diagnostics(
     stats.decode_partitioned_paged_calls = int(
         owned_attn.get("decode_partitioned_paged_calls") or 0
     )
+    try:
+        from mtplx.models.qwen4_exp import qsa_prefill_engagement
+        qsa_counts = qsa_prefill_engagement()
+        stats.decode_flash_skip = qsa_counts.get("decode_flash_skip", 0)
+        stats.decode_dense_mask = qsa_counts.get("decode_dense_mask", 0)
+        stats.gather_rows = qsa_counts.get("gather_rows", 0)
+        stats.dense_fallback = qsa_counts.get("dense_fallback", 0)
+        stats.decode_gather = qsa_counts.get("decode_gather", 0)
+        stats.qsa_prefill_engagement = qsa_counts
+    except Exception:
+        pass
 
 
 def _sustained_prefill_enabled() -> bool:
@@ -2184,6 +2206,12 @@ class GenerationStats:
     # Fork-EV shadow telemetry aggregate (MTPLX_FORKEV_TELEMETRY); empty dict
     # when the instrument is off. Schema: mtplx/forkev_telemetry.py snapshot().
     forkev: dict[str, object] = field(default_factory=dict)
+    decode_flash_skip: int = 0
+    decode_dense_mask: int = 0
+    gather_rows: int = 0
+    dense_fallback: int = 0
+    decode_gather: int = 0
+    qsa_prefill_engagement: dict[str, int] = field(default_factory=dict)
     events: list[dict] = field(default_factory=list)
 
     def to_dict(self) -> dict:

@@ -273,9 +273,18 @@ def detect_total_ram_bytes() -> int | None:
 def usable_engine_bytes(total_ram_bytes: int) -> int:
     """The engine's allocator envelope for a machine of this size."""
     total = int(total_ram_bytes)
+    frac = ENGINE_RAM_FRACTION
+    raw = os.environ.get("MTPLX_ENGINE_RAM_FRACTION")
+    if raw is not None:
+        try:
+            val = float(raw)
+            if 0.1 <= val <= 0.98:
+                frac = val
+        except ValueError:
+            pass
     return min(
         total,
-        max(ENGINE_RAM_FLOOR_BYTES, int(total * ENGINE_RAM_FRACTION)),
+        max(ENGINE_RAM_FLOOR_BYTES, int(total * frac)),
         ENGINE_RAM_CAP_BYTES,
     )
 
@@ -427,7 +436,10 @@ def plan_memory(
         # computed from the REAL machine. Under a tighter --memory-budget
         # the formula on the planning RAM must still win, or a simulated
         # 48G seat would inherit the 128G box's 96G envelope.
-        usable = min(int(usable_bytes_override), usable_engine_bytes(planning_ram))
+        if budget is not None:
+            usable = min(int(usable_bytes_override), usable_engine_bytes(planning_ram))
+        else:
+            usable = min(total_ram, int(usable_bytes_override))
     else:
         usable = usable_engine_bytes(planning_ram)
 

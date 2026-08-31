@@ -152,3 +152,52 @@ def test_rollback_below_engage_threshold_still_exact(attn):
         golden = attn(chunk, fresh)
 
     assert mx.allclose(out, golden, atol=0, rtol=0).item()
+
+
+def test_qsa_cache_quantized_pooled_mirror():
+    """Verify quantized pooled key mirror (q8 and q4) saves memory and maintains
+    valid transposed view."""
+    # Test q8
+    cache8 = QSACache(kv_bits=8)
+    assert cache8.pooled_bits == 8
+    blocks = mx.random.normal((1, 64, 16)).astype(mx.float32)
+    cache8.write_pooled(blocks, 0, 64)
+    assert cache8.pooled_quant_t is not None
+    assert cache8.pooled_f32_t is None
+    view8 = cache8.pooled_f32_view(64)
+    assert view8.shape == (1, 1, 16, 64)
+    # Check decompression closeness
+    assert mx.allclose(view8[0, 0], mx.swapaxes(blocks[0], 0, 1), atol=1e-1).item()
+
+    # Test state roundtrip
+    donor8 = QSACache(kv_bits=8)
+    donor8.write_pooled(blocks, 0, 64)
+    resumed8 = QSACache(kv_bits=8)
+    resumed8.state = donor8.state
+    assert resumed8.pooled_quant_t is not None
+    view_resumed = resumed8.pooled_f32_view(64)
+    assert view_resumed.shape == (1, 1, 16, 64)
+
+    # Test q4
+    cache4 = QSACache(kv_bits=4)
+    assert cache4.pooled_bits == 4
+    cache4.write_pooled(blocks, 0, 64)
+    assert cache4.pooled_quant_t is not None
+    view4 = cache4.pooled_f32_view(64)
+    assert view4.shape == (1, 1, 16, 64)
+
+
+def test_adaptive_mtp_history_window_throttling():
+    from mtplx.generation import _mtp_history_last_window_tokens
+
+    # Standard scaling
+    assert _mtp_history_last_window_tokens(1000) == 8192
+    assert _mtp_history_last_window_tokens(32768) == 16384
+    assert _mtp_history_last_window_tokens(65536) == 32768
+    assert _mtp_history_last_window_tokens(262144) == 32768
+
+    # Adaptive throttling at extreme depth (>262k) caps to 16,384 tokens
+    assert _mtp_history_last_window_tokens(262145) == 16384
+    assert _mtp_history_last_window_tokens(524288) == 16384
+    assert _mtp_history_last_window_tokens(1048576) == 16384
+

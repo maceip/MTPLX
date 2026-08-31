@@ -829,6 +829,15 @@ def _server_runtime_env_overrides(
         ):
             if os.environ.get(key) is None:
                 overrides.setdefault(key, "1")
+        if os.environ.get("MTPLX_QSA_FLASH") is None:
+            try:
+                from mtplx.models.qwen4_exp import qsa_prefill_lane_auto_supported
+                if qsa_prefill_lane_auto_supported():
+                    overrides.setdefault("MTPLX_QSA_FLASH", "1")
+            except Exception:
+                pass
+        if os.environ.get("MTPLX_COMPILED_VERIFY_MAX_CONTEXT") is None:
+            overrides.setdefault("MTPLX_COMPILED_VERIFY_MAX_CONTEXT", "0")
         if os.environ.get("MTPLX_NAX_VERIFY") is None:
             # The turbo profile arms the 27B NAX verify patch
             # (MTPLX_NAX_VERIFY=1); on this family it is unmeasured and
@@ -2066,20 +2075,19 @@ def _select_backend_context_window(
     with the plan warning loudly instead of refusing.
     """
     requested_value = int(requested or 0)
+    if requested_value > 0:
+        return max(4_096, requested_value)
     default_value = (
         backend.context_window_policy.default
         if backend.backend_id == "laguna_ar"
         else int(model_max)
     )
     fit = int(machine_fit or 0)
-    if requested_value <= 0 and fit > 0:
+    if fit > 0:
         default_value = min(int(default_value), fit)
     return max(
         4_096,
-        min(
-            int(model_max),
-            requested_value if requested_value > 0 else int(default_value),
-        ),
+        min(int(model_max), int(default_value)),
     )
 
 
@@ -17691,6 +17699,12 @@ PUBLIC_MTPLX_STATS_KEYS = (
     "rollback_time_s",
     "graphbank",
     "repair_time_by_reject_depth_s",
+    "decode_flash_skip",
+    "decode_dense_mask",
+    "gather_rows",
+    "dense_fallback",
+    "decode_gather",
+    "qsa_prefill_engagement",
     *MAINTENANCE_TIMING_STATS_KEYS,
     "session_cache_hit",
     "session_prompt_prefix_bank_commit",
@@ -20096,7 +20110,8 @@ def _reject_prompt_over_context(state: ServerState, prompt_token_count: int) -> 
         )
     plan = getattr(state, "memory_plan", None)
     if (
-        plan is not None
+        os.environ.get("MTPLX_ALLOW_OVERCOMMITTED") not in {"1", "true", "yes", "on"}
+        and plan is not None
         and bool(getattr(plan, "context_overcommitted", False))
         and int(getattr(plan, "context_window_fit", 0) or 0) > 0
         and int(prompt_token_count) >= int(plan.context_window_fit)
