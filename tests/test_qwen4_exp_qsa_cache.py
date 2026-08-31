@@ -163,7 +163,7 @@ def test_qsa_cache_quantized_pooled_mirror():
     blocks = mx.random.normal((1, 64, 16)).astype(mx.float32)
     cache8.write_pooled(blocks, 0, 64)
     assert cache8.pooled_quant_t is not None
-    assert cache8.pooled_f32_t is None
+    assert cache8.pooled_f32_t is not None
     view8 = cache8.pooled_f32_view(64)
     assert view8.shape == (1, 1, 16, 64)
     # Check decompression closeness
@@ -230,4 +230,18 @@ def test_adaptive_mtp_history_window_throttling():
     assert _mtp_history_last_window_tokens(262145) == 16384
     assert _mtp_history_last_window_tokens(524288) == 16384
     assert _mtp_history_last_window_tokens(1048576) == 16384
+
+
+def test_qsa_cache_empty_state_restore_clears_kv():
+    cache = QSACache(kv_bits=8)
+    cache.kv.offset = 128
+    cache.raw_keys = mx.zeros((1, 128, 16), mx.float32)
+    cache.pooled = mx.zeros((1, 32, 16), mx.float32)
+    # Restore empty snapshot
+    cache.state = (None, None, None, None)
+    assert cache.kv.offset == 0
+    assert cache.raw_keys is None
+    assert cache.pooled is None
+    assert cache.pooled_len == 0
+
 

@@ -1672,24 +1672,23 @@ class QSACache:
                 if padded_nb > nb_total:
                     slice_t = mx.pad(slice_t, [(0, 0), (0, 0), (0, 0), (0, padded_nb - nb_total)])
                 self.pooled_quant_t = mx.quantize(slice_t, group_size=64, bits=self.pooled_bits)
-            self.pooled_f32_t = None
+
+        cap_blocks = self.pooled.shape[1]
+        if self.pooled_f32_t is None:
+            self.pooled_f32_t = mx.swapaxes(self.pooled.astype(mx.float32), 1, 2)[
+                :, None
+            ]
+        elif self.pooled_f32_t.shape[3] < cap_blocks:
+            grown_t = mx.zeros((1, 1, blocks.shape[2], cap_blocks), mx.float32)
+            grown_t[..., : self.pooled_f32_t.shape[3]] = self.pooled_f32_t
+            self.pooled_f32_t = grown_t
+            self.pooled_f32_t[..., nb_start:nb_total] = mx.swapaxes(
+                blocks.astype(mx.float32), 1, 2
+            )[:, None]
         else:
-            cap_blocks = self.pooled.shape[1]
-            if self.pooled_f32_t is None:
-                self.pooled_f32_t = mx.swapaxes(self.pooled.astype(mx.float32), 1, 2)[
-                    :, None
-                ]
-            elif self.pooled_f32_t.shape[3] < cap_blocks:
-                grown_t = mx.zeros((1, 1, blocks.shape[2], cap_blocks), mx.float32)
-                grown_t[..., : self.pooled_f32_t.shape[3]] = self.pooled_f32_t
-                self.pooled_f32_t = grown_t
-                self.pooled_f32_t[..., nb_start:nb_total] = mx.swapaxes(
-                    blocks.astype(mx.float32), 1, 2
-                )[:, None]
-            else:
-                self.pooled_f32_t[..., nb_start:nb_total] = mx.swapaxes(
-                    blocks.astype(mx.float32), 1, 2
-                )[:, None]
+            self.pooled_f32_t[..., nb_start:nb_total] = mx.swapaxes(
+                blocks.astype(mx.float32), 1, 2
+            )[:, None]
         self.pooled_len = nb_total
 
     def pooled_f32_view(self, nb: int) -> mx.array:
@@ -1699,29 +1698,23 @@ class QSACache:
         drops it) or a compiled-indexer commit (which replaces ``pooled``
         wholesale and nulls the mirror); otherwise a zero-copy slice of the
         maintained buffer."""
-        if self.pooled_bits in (4, 8):
-            if self.pooled_quant_t is None and self.pooled is not None and self.pooled.shape[1] > 0:
-                nb_val = self.pooled.shape[1]
-                slice_t = mx.swapaxes(self.pooled[:, :nb_val, :].astype(mx.float32), 1, 2)[:, None]
-                padded_nb = ((nb_val + 63) // 64) * 64
-                if padded_nb > nb_val:
-                    slice_t = mx.pad(slice_t, [(0, 0), (0, 0), (0, 0), (0, padded_nb - nb_val)])
-                self.pooled_quant_t = mx.quantize(slice_t, group_size=64, bits=self.pooled_bits)
-            if self.pooled_quant_t is not None:
+        if self.pooled_f32_t is None or self.pooled_f32_t.shape[3] < nb:
+            if self.pooled_bits in (4, 8) and self.pooled_quant_t is not None:
                 w, s, b = self.pooled_quant_t
-                dequant = mx.dequantize(
+                self.pooled_f32_t = mx.dequantize(
                     w,
                     s,
                     b,
                     group_size=64,
                     bits=self.pooled_bits,
                 )
-                return dequant[..., :nb]
-        if self.pooled_f32_t is None or self.pooled_f32_t.shape[3] < nb:
-            self.pooled_f32_t = mx.swapaxes(
-                self.pooled.astype(mx.float32), 1, 2
-            )[:, None]
-        return self.pooled_f32_t[..., :nb]
+            elif self.pooled is not None and self.pooled.shape[1] > 0:
+                self.pooled_f32_t = mx.swapaxes(
+                    self.pooled.astype(mx.float32), 1, 2
+                )[:, None]
+        if self.pooled_f32_t is not None:
+            return self.pooled_f32_t[..., :nb]
+        return mx.zeros((1, 1, 0, nb), mx.float32)
 
     def reserve_indexer_capacity(
         self,
@@ -1833,6 +1826,13 @@ class QSACache:
         keys, values, raw, pooled = v
         if keys is not None and values is not None:
             self.kv.state = (keys, values)
+        else:
+            if isinstance(self.kv, QuantizedKVCache):
+                self.kv = QuantizedKVCache(
+                    group_size=self.kv.group_size, bits=self.kv.bits
+                )
+            else:
+                self.kv = KVCache()
         self.raw_keys = raw
         self.pooled = pooled
         self.pooled_len = 0 if pooled is None else pooled.shape[1]
@@ -3588,15 +3588,21 @@ class _SidecarGather:
         # — and keeps its speed when macOS reclaims the file's page cache
         # under memory pressure. All access is on the single generation
         # thread (stage()/forward); the pread pool only warms pages and
-        # never touches this dict. MTPLX_NGRAM_HOT_MB sizes it
-        # (default 1024; 0 disables).
+        # never touches this dict. MTPLX_NGRAM_HOT_ROWS / MTPLX_NGRAM_HOT_MB
+        # sizes it (default 1024 MB; 0 disables).
         self._hot = OrderedDict()
         self._hot_row_bytes = max(1, sum(rb for _, rb in self._row_meta))
-        try:
-            hot_mb = int(os.environ.get("MTPLX_NGRAM_HOT_MB", "1024"))
-        except ValueError:
-            hot_mb = 1024
-        self._hot_cap_rows = (max(0, hot_mb) * 2**20) // self._hot_row_bytes
+        if os.environ.get("MTPLX_NGRAM_HOT_ROWS"):
+            try:
+                self._hot_cap_rows = max(0, int(os.environ.get("MTPLX_NGRAM_HOT_ROWS") or 0))
+            except ValueError:
+                self._hot_cap_rows = 0
+        else:
+            try:
+                hot_mb = int(os.environ.get("MTPLX_NGRAM_HOT_MB", "1024"))
+            except ValueError:
+                hot_mb = 1024
+            self._hot_cap_rows = (max(0, hot_mb) * 2**20) // self._hot_row_bytes
         self.hot_hits = 0
         self.hot_misses = 0
 

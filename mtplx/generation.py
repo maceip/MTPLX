@@ -2906,6 +2906,16 @@ def _prefill_restored_prompt_suffix(
     emit_chunk(1, chunk_elapsed, started)
     _check_postcommit_abort(abort_check)
     _check_splice_consumed()
+    if use_committed_mtp and mtp_history_policy == "last_window" and restored.mtp_history_cache:
+        target_win = _mtp_history_last_window_tokens(tokens_total)
+        if target_win > 0:
+            first_entry = restored.mtp_history_cache[0]
+            off = getattr(first_entry, "offset", None)
+            if off is not None and off > target_win:
+                excess = off - target_win
+                for c in restored.mtp_history_cache:
+                    if hasattr(c, "trim"):
+                        c.trim(excess)
     return (
         suffix_logits[:, -1, :],
         suffix_hidden[:, -1:, :] if suffix_hidden is not None else None,
@@ -3008,6 +3018,7 @@ def _entry_matches_restore_lookup(
     mtp_history_policy: str | None,
     draft_head_identity: str | None,
     policy_fingerprint: str | None,
+    prompt_tokens: int | None = None,
 ) -> bool:
     if getattr(entry, "model_path", None) != str(rt.model_path):
         return False
@@ -3026,6 +3037,16 @@ def _entry_matches_restore_lookup(
         if entry_policy != mtp_history_policy:
             committed = {"committed", "last_window"}
             if entry_policy not in committed or mtp_history_policy not in committed:
+                return False
+        if mtp_history_policy == "last_window" and prompt_tokens is not None:
+            req_window = _mtp_history_last_window_tokens(int(prompt_tokens))
+            entry_len = int(
+                getattr(entry, "prefix_len", 0)
+                or getattr(entry, "snapshot_epoch", 0)
+                or len(getattr(entry, "token_ids", ()) or ())
+            )
+            entry_window = _mtp_history_last_window_tokens(entry_len)
+            if req_window > entry_window:
                 return False
     if (
         draft_head_identity is not None
@@ -3166,6 +3187,7 @@ def _restore_near_prefix_prompt_state(
             mtp_history_policy=mtp_history_policy,
             draft_head_identity=draft_head_identity,
             policy_fingerprint=policy_fingerprint,
+            prompt_tokens=len(prompt_ids),
         ):
             _near_debug("identity_mismatch")
             continue
@@ -4162,6 +4184,30 @@ def restore_or_prefill_prompt_state(
             cache_factory=restore_cache_factory,
         )
         restore_elapsed_s = time.perf_counter() - restore_started
+        if (
+            restored is not None
+            and mtp_history_policy == "last_window"
+            and restored.mtp_history_cache is not None
+        ):
+            req_window = _mtp_history_last_window_tokens(len(prompt_ids))
+            entry_len = int(
+                getattr(restored.entry, "prefix_len", 0)
+                or getattr(restored.entry, "snapshot_epoch", 0)
+                or len(getattr(restored.entry, "token_ids", ()) or ())
+            )
+            entry_window = _mtp_history_last_window_tokens(entry_len)
+            if req_window > entry_window:
+                # Stored history is narrower than required; drop restored and rebuild
+                restored = None
+            elif req_window < entry_window:
+                # Stored history is wider than required (e.g. throttled at deep context); trim excess
+                for c in restored.mtp_history_cache:
+                    off = getattr(c, "offset", None)
+                    if off is not None and off > req_window:
+                        excess = off - req_window
+                        if hasattr(c, "trim"):
+                            c.trim(excess)
+
         if restored is not None and (
             not _mtp_history_uses_committed_cache(mtp_history_policy)
             or restored.mtp_history_cache is not None
