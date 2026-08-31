@@ -301,4 +301,36 @@ def test_entry_matches_restore_lookup_history_window():
     )
 
 
+def test_adaptive_mtp_history_deep_cap_clamped(monkeypatch):
+    from mtplx.generation import _mtp_history_last_window_tokens
+
+    monkeypatch.setenv("MTPLX_MTP_HISTORY_DEEP_CAP", "0")
+    # Should clamp to at least 1, not return 0 or negative
+    assert _mtp_history_last_window_tokens(300000) >= 1
+
+    monkeypatch.setenv("MTPLX_MTP_HISTORY_DEEP_CAP", "-100")
+    assert _mtp_history_last_window_tokens(300000) >= 1
+
+
+def test_qsa_cache_state_restore_type_mismatch_raises():
+    import pytest
+
+    quant_cache = QSACache(kv_bits=8)
+    dense_keys = mx.zeros((1, 1, 10, 64), mx.float32)
+    dense_values = mx.zeros((1, 1, 10, 64), mx.float32)
+
+    with pytest.raises(ValueError, match="Cannot restore dense KV snapshot into QuantizedKVCache"):
+        quant_cache.state = (dense_keys, dense_values, None, None)
+
+    dense_cache = QSACache(kv_bits=None)
+    quant_tuple = (
+        mx.zeros((1, 1, 10, 16), mx.uint32),
+        mx.zeros((1, 1, 10, 1), mx.float32),
+        mx.zeros((1, 1, 10, 1), mx.float32),
+    )
+    with pytest.raises(ValueError, match="Cannot restore quantized KV snapshot into dense KVCache"):
+        dense_cache.state = (quant_tuple, quant_tuple, None, None)
+
+
+
 

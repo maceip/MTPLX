@@ -1825,6 +1825,18 @@ class QSACache:
             )
         keys, values, raw, pooled = v
         if keys is not None and values is not None:
+            if isinstance(self.kv, QuantizedKVCache):
+                if not (isinstance(keys, tuple) and isinstance(values, tuple)):
+                    raise ValueError(
+                        "Cannot restore dense KV snapshot into QuantizedKVCache; "
+                        "drop snapshot and re-prefill"
+                    )
+            else:
+                if isinstance(keys, tuple) or isinstance(values, tuple):
+                    raise ValueError(
+                        "Cannot restore quantized KV snapshot into dense KVCache; "
+                        "drop snapshot and re-prefill"
+                    )
             self.kv.state = (keys, values)
         else:
             if isinstance(self.kv, QuantizedKVCache):
@@ -2469,6 +2481,13 @@ class QSAIndexer(nn.Module):
         ):
             return False
 
+        if (
+            decode
+            and mode == "blocks"
+            and (pos_start + int(source.shape[1])) >= _qsa_parallel_indexer_min_context()
+        ):
+            return False
+
         if mode not in ("update_only", "prefill_blocks") and source.dtype == mx.float32:
             from mtplx.kernels.qsa_indexer_select import (
                 qsa_indexer_select_nax_available,
@@ -2648,6 +2667,7 @@ class QSAIndexer(nn.Module):
         if mode == "blocks":
             block_ids, _, _ = result.selection
             tail_start = ((pos_start + 1) // self.ratio) * self.ratio
+            _qsa_prefill_count("decode_flash_skip")
             return ("flash", block_ids[0], tail_start)
         if mode == "prefill_blocks":
             block_ids, block_valid, _ = result.selection
@@ -2655,8 +2675,10 @@ class QSAIndexer(nn.Module):
             return ("flash_prefill", block_ids, block_valid)
         if mode == "row_tokens":
             token_idx, token_ok = result.selection
+            _qsa_prefill_count("gather_rows")
             return ("gather_rows", token_idx, token_ok)
         if mode == "dense_mask":
+            _qsa_prefill_count("decode_dense_mask")
             return result.selection[..., :total]
         raise ValueError(f"unknown compiled QSA indexer mode {mode!r}")
 

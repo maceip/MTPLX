@@ -18424,6 +18424,16 @@ def _policy_fingerprint(
         f"proposal_cache={json.dumps(proposal_cache, sort_keys=True, separators=(',', ':'))}",
         f"online_hidden={json.dumps(online_hidden, sort_keys=True, separators=(',', ':'))}",
     ]
+    qsa_kv_bits = str(
+        os.environ.get("MTPLX_QSA_KV_BITS")
+        or os.environ.get("MTPLX_KV_QUANT")
+        or "0"
+    ).strip()
+    qsa_pooled_bits = str(os.environ.get("MTPLX_QSA_POOLED_BITS") or "0").strip()
+    if qsa_kv_bits != "0":
+        parts.append(f"qsa_kv_bits={qsa_kv_bits}")
+    if qsa_pooled_bits != "0":
+        parts.append(f"qsa_pooled_bits={qsa_pooled_bits}")
     normalized_cache_scope = str(cache_scope or "").strip()
     mtp_batch_lane = getattr(state, "mtp_batch_lane", None)
     if mtp_batch_lane is not None:

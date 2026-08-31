@@ -420,7 +420,7 @@ def _mtp_history_last_window_tokens(prompt_tokens: int = 0) -> int:
     # Adaptive MTP Window Throttling at Extreme Depths (Item 3):
     # Cap draft head history window at 16k when context > 262k to keep verification rounds bounded < 5ms.
     if prompt_tokens > 262144:
-        cap = _env_int("MTPLX_MTP_HISTORY_DEEP_CAP", 16384)
+        cap = max(1, _env_int("MTPLX_MTP_HISTORY_DEEP_CAP", 16384))
         return min(max(base, 16384), cap)
     # Context-scaled widening window (Item 6): 8k at 16k, 16k at 32k, 32k at 64k+
     if prompt_tokens >= 65536:
