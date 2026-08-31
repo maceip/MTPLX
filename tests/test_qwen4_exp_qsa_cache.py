@@ -245,3 +245,60 @@ def test_qsa_cache_empty_state_restore_clears_kv():
     assert cache.pooled_len == 0
 
 
+def test_entry_matches_restore_lookup_history_window():
+    from unittest.mock import MagicMock
+    from mtplx.generation import _entry_matches_restore_lookup
+
+    rt = MagicMock()
+    rt.model_path = "test-model"
+
+    # Stored last_window entry with 8K history (from 16K prefix)
+    entry_lw = MagicMock()
+    entry_lw.model_path = "test-model"
+    entry_lw.hidden_variant = "post_norm"
+    entry_lw.template_hash = "h1"
+    entry_lw.mtp_history_policy = "last_window"
+    entry_lw.draft_head_identity = "d1"
+    entry_lw.policy_fingerprint = "fp1"
+    entry_lw.prefix_len = 16384
+    entry_lw.mtp_snapshot_epoch = 16384
+    entry_lw.snapshot_epoch = 16384
+
+    # 32K prompt requires 16K window -> 8K stored history is too narrow
+    assert not _entry_matches_restore_lookup(
+        entry_lw,
+        rt,
+        hidden_variant="post_norm",
+        template_hash="h1",
+        mtp_history_policy="last_window",
+        draft_head_identity="d1",
+        policy_fingerprint="fp1",
+        prompt_tokens=32768,
+    )
+
+    # Stored committed entry with 16K history
+    entry_com = MagicMock()
+    entry_com.model_path = "test-model"
+    entry_com.hidden_variant = "post_norm"
+    entry_com.template_hash = "h1"
+    entry_com.mtp_history_policy = "committed"
+    entry_com.draft_head_identity = "d1"
+    entry_com.policy_fingerprint = "fp1"
+    entry_com.prefix_len = 16384
+    entry_com.mtp_snapshot_epoch = 16384
+    entry_com.snapshot_epoch = 16384
+
+    # 32K prompt requires 16K window -> 16K stored history is sufficient
+    assert _entry_matches_restore_lookup(
+        entry_com,
+        rt,
+        hidden_variant="post_norm",
+        template_hash="h1",
+        mtp_history_policy="last_window",
+        draft_head_identity="d1",
+        policy_fingerprint="fp1",
+        prompt_tokens=32768,
+    )
+
+
+

@@ -3045,8 +3045,12 @@ def _entry_matches_restore_lookup(
                 or getattr(entry, "snapshot_epoch", 0)
                 or len(getattr(entry, "token_ids", ()) or ())
             )
-            entry_window = _mtp_history_last_window_tokens(entry_len)
-            if req_window > entry_window:
+            entry_stored_history = (
+                entry_len
+                if entry_policy == "committed"
+                else _mtp_history_last_window_tokens(entry_len)
+            )
+            if req_window > entry_stored_history:
                 return False
     if (
         draft_head_identity is not None
@@ -4187,24 +4191,19 @@ def restore_or_prefill_prompt_state(
         if (
             restored is not None
             and mtp_history_policy == "last_window"
-            and restored.mtp_history_cache is not None
+            and restored.mtp_history_cache
         ):
             req_window = _mtp_history_last_window_tokens(len(prompt_ids))
-            entry_len = int(
-                getattr(restored.entry, "prefix_len", 0)
-                or getattr(restored.entry, "snapshot_epoch", 0)
-                or len(getattr(restored.entry, "token_ids", ()) or ())
-            )
-            entry_window = _mtp_history_last_window_tokens(entry_len)
-            if req_window > entry_window:
-                # Stored history is narrower than required; drop restored and rebuild
-                restored = None
-            elif req_window < entry_window:
-                # Stored history is wider than required (e.g. throttled at deep context); trim excess
-                for c in restored.mtp_history_cache:
-                    off = getattr(c, "offset", None)
-                    if off is not None and off > req_window:
-                        excess = off - req_window
+            first_entry = restored.mtp_history_cache[0]
+            actual_history = getattr(first_entry, "offset", None)
+            if actual_history is not None:
+                entry_policy = getattr(restored.entry, "mtp_history_policy", None)
+                if entry_policy == "last_window" and req_window > actual_history:
+                    # Stored history is narrower than required; drop restored and rebuild
+                    restored = None
+                elif actual_history > req_window:
+                    excess = actual_history - req_window
+                    for c in restored.mtp_history_cache:
                         if hasattr(c, "trim"):
                             c.trim(excess)
 
