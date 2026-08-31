@@ -1672,23 +1672,24 @@ class QSACache:
                 if padded_nb > nb_total:
                     slice_t = mx.pad(slice_t, [(0, 0), (0, 0), (0, 0), (0, padded_nb - nb_total)])
                 self.pooled_quant_t = mx.quantize(slice_t, group_size=64, bits=self.pooled_bits)
-
-        cap_blocks = self.pooled.shape[1]
-        if self.pooled_f32_t is None:
-            self.pooled_f32_t = mx.swapaxes(self.pooled.astype(mx.float32), 1, 2)[
-                :, None
-            ]
-        elif self.pooled_f32_t.shape[3] < cap_blocks:
-            grown_t = mx.zeros((1, 1, blocks.shape[2], cap_blocks), mx.float32)
-            grown_t[..., : self.pooled_f32_t.shape[3]] = self.pooled_f32_t
-            self.pooled_f32_t = grown_t
-            self.pooled_f32_t[..., nb_start:nb_total] = mx.swapaxes(
-                blocks.astype(mx.float32), 1, 2
-            )[:, None]
+            self.pooled_f32_t = None
         else:
-            self.pooled_f32_t[..., nb_start:nb_total] = mx.swapaxes(
-                blocks.astype(mx.float32), 1, 2
-            )[:, None]
+            cap_blocks = self.pooled.shape[1]
+            if self.pooled_f32_t is None:
+                self.pooled_f32_t = mx.swapaxes(self.pooled.astype(mx.float32), 1, 2)[
+                    :, None
+                ]
+            elif self.pooled_f32_t.shape[3] < cap_blocks:
+                grown_t = mx.zeros((1, 1, blocks.shape[2], cap_blocks), mx.float32)
+                grown_t[..., : self.pooled_f32_t.shape[3]] = self.pooled_f32_t
+                self.pooled_f32_t = grown_t
+                self.pooled_f32_t[..., nb_start:nb_total] = mx.swapaxes(
+                    blocks.astype(mx.float32), 1, 2
+                )[:, None]
+            else:
+                self.pooled_f32_t[..., nb_start:nb_total] = mx.swapaxes(
+                    blocks.astype(mx.float32), 1, 2
+                )[:, None]
         self.pooled_len = nb_total
 
     def pooled_f32_view(self, nb: int) -> mx.array:
@@ -1698,17 +1699,33 @@ class QSACache:
         drops it) or a compiled-indexer commit (which replaces ``pooled``
         wholesale and nulls the mirror); otherwise a zero-copy slice of the
         maintained buffer."""
-        if self.pooled_f32_t is None or self.pooled_f32_t.shape[3] < nb:
-            if self.pooled_bits in (4, 8) and self.pooled_quant_t is not None:
+        if self.pooled_bits in (4, 8):
+            if self.pooled_quant_t is None and self.pooled is not None and self.pooled.shape[1] > 0:
+                nb_val = self.pooled.shape[1]
+                slice_t = mx.swapaxes(self.pooled[:, :nb_val, :].astype(mx.float32), 1, 2)[:, None]
+                padded_nb = ((nb_val + 63) // 64) * 64
+                if padded_nb > nb_val:
+                    slice_t = mx.pad(slice_t, [(0, 0), (0, 0), (0, 0), (0, padded_nb - nb_val)])
+                self.pooled_quant_t = mx.quantize(slice_t, group_size=64, bits=self.pooled_bits)
+            if self.pooled_quant_t is not None:
                 w, s, b = self.pooled_quant_t
-                self.pooled_f32_t = mx.dequantize(
-                    w,
-                    s,
-                    b,
+                n_groups = (nb + 63) // 64
+                words_per_group = (64 * self.pooled_bits) // 32
+                w_slice = w[..., :n_groups * words_per_group]
+                s_slice = s[..., :n_groups]
+                b_slice = b[..., :n_groups] if b is not None else None
+                dequant = mx.dequantize(
+                    w_slice,
+                    s_slice,
+                    b_slice,
                     group_size=64,
                     bits=self.pooled_bits,
                 )
-            elif self.pooled is not None and self.pooled.shape[1] > 0:
+                return dequant[..., :nb]
+            return mx.zeros((1, 1, 0, nb), mx.float32)
+
+        if self.pooled_f32_t is None or self.pooled_f32_t.shape[3] < nb:
+            if self.pooled is not None and self.pooled.shape[1] > 0:
                 self.pooled_f32_t = mx.swapaxes(
                     self.pooled.astype(mx.float32), 1, 2
                 )[:, None]
@@ -1799,7 +1816,7 @@ class QSACache:
             for arr in self.pooled_quant_t:
                 if arr is not None:
                     total += arr.nbytes
-        elif self.pooled_f32_t is not None:
+        if self.pooled_f32_t is not None:
             total += self.pooled_f32_t.nbytes
         return total
 

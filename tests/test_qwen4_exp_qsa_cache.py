@@ -163,7 +163,7 @@ def test_qsa_cache_quantized_pooled_mirror():
     blocks = mx.random.normal((1, 64, 16)).astype(mx.float32)
     cache8.write_pooled(blocks, 0, 64)
     assert cache8.pooled_quant_t is not None
-    assert cache8.pooled_f32_t is not None
+    assert cache8.pooled_f32_t is None
     view8 = cache8.pooled_f32_view(64)
     assert view8.shape == (1, 1, 16, 64)
     # Check decompression closeness
